@@ -5,12 +5,12 @@ services:
       - "8991:8991"
     environment:
       API_KEY: "sk-grok-rs-change-me"
-      ADMIN_API_KEY: "change-this-admin-key"
+      ADMIN_PASSWORD: "change-this-admin-password"
       GROK_MANAGEMENT_KEY: "change-this-management-key"
+      COOKIE_SECURE: "false"
     volumes:
       - grok-data:/data
     restart: unless-stopped
 
 volumes:
   grok-data:
-

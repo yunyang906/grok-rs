@@ -3,51 +3,68 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>grok-rs 多账号管理</title>
+  <title>grok-rs 管理后台</title>
   <style>
-    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui; background:#09090b; color:#f4f4f5 }
-    body { margin:0; min-height:100vh; background:radial-gradient(circle at 20% 0,#1d283a 0,transparent 32%),#09090b }
-    main { max-width:980px; margin:auto; padding:42px 22px }
-    h1 { font-size:34px; margin:0 0 8px } .sub { color:#a1a1aa; margin-bottom:28px }
-    .bar,.card { background:#141417; border:1px solid #29292e; border-radius:14px; padding:16px; box-shadow:0 12px 34px #0007 }
-    .bar { display:flex; gap:10px; flex-wrap:wrap; align-items:center }
-    input,button { border-radius:9px; border:1px solid #34343a; padding:10px 13px; font:inherit }
-    input { flex:1; min-width:220px; background:#0c0c0f; color:#fff } button { background:#7c3aed; color:#fff; cursor:pointer; font-weight:650 }
-    button.secondary { background:#242429 } button.danger { background:#7f1d1d } button:disabled { opacity:.45; cursor:not-allowed }
-    #notice { min-height:24px; color:#c4b5fd; padding:12px 2px }
-    #accounts { display:grid; gap:12px }
-    .account { display:flex; align-items:center; gap:14px }.info { flex:1 }.name { font-weight:700 }.meta { color:#a1a1aa;font-size:13px;margin-top:5px }
-    .pill { border-radius:99px; padding:4px 9px; font-size:12px; background:#14532d }.off { background:#3f3f46 }
-    dialog { border:1px solid #33333a; border-radius:16px; background:#151519; color:#fff; max-width:520px; padding:24px }
-    dialog::backdrop { background:#000b }.code { font-size:28px;letter-spacing:4px;font-weight:800;background:#09090b;padding:12px;border-radius:10px;text-align:center }
-    a { color:#a78bfa } @media(max-width:650px){.account{align-items:flex-start;flex-wrap:wrap}.info{min-width:70%}}
+    :root{color-scheme:dark;font-family:Inter,"SF Pro Display",ui-sans-serif,system-ui,-apple-system,sans-serif;--bg:#08090c;--panel:#111318;--panel2:#171920;--line:#272a33;--muted:#9095a3;--text:#f4f5f7;--purple:#7c5cff;--purple2:#9b8aff;--green:#42d392;--red:#ff626f;--amber:#f7b955}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);min-height:100vh}button,input{font:inherit}button{cursor:pointer}.hidden{display:none!important}
+    .login-page{min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 20% 15%,#242044 0,transparent 28%),radial-gradient(circle at 85% 85%,#102b2b 0,transparent 25%),#08090c}
+    .login-card{width:min(430px,100%);padding:36px;background:#111318eF;border:1px solid #2c2f3a;border-radius:22px;box-shadow:0 30px 100px #000a;backdrop-filter:blur(16px)}
+    .logo{width:48px;height:48px;border-radius:14px;display:grid;place-items:center;font-weight:900;font-size:22px;background:linear-gradient(145deg,var(--purple),#4b31ce);box-shadow:0 12px 30px #7158ff55}.login-card h1{font-size:28px;margin:24px 0 8px}.login-card .lead{color:var(--muted);margin:0 0 28px;line-height:1.6}
+    label{display:block;color:#c7cad2;font-size:13px;font-weight:650;margin:0 0 8px}.input{width:100%;height:48px;border-radius:11px;border:1px solid #30333d;background:#0a0b0f;color:#fff;padding:0 14px;outline:none}.input:focus{border-color:var(--purple);box-shadow:0 0 0 3px #7c5cff25}
+    .primary{border:0;color:white;background:linear-gradient(135deg,var(--purple),#6644e9);font-weight:750;border-radius:10px;padding:11px 16px;box-shadow:0 8px 24px #6e50ed30}.primary:hover{filter:brightness(1.08)}.primary:disabled{opacity:.5;cursor:not-allowed}.login-card .primary{width:100%;height:48px;margin-top:16px}.login-error{color:#ff9ba4;font-size:13px;min-height:20px;margin-top:12px}.security-note{display:flex;gap:9px;align-items:flex-start;color:#777d8b;font-size:12px;line-height:1.5;margin-top:22px;padding-top:20px;border-top:1px solid #252832}
+    .app{min-height:100vh;display:grid;grid-template-columns:248px 1fr}.sidebar{position:sticky;top:0;height:100vh;border-right:1px solid var(--line);background:#0d0f13;padding:24px 16px;display:flex;flex-direction:column}.brand{display:flex;gap:12px;align-items:center;padding:0 9px 25px}.brand .logo{width:38px;height:38px;border-radius:11px;font-size:17px}.brand strong{display:block;font-size:18px}.brand small{color:var(--muted)}
+    .nav-title{font-size:11px;color:#636875;text-transform:uppercase;letter-spacing:.12em;padding:14px 12px 8px}.nav-item{display:flex;align-items:center;gap:11px;color:#999eaa;padding:11px 12px;border-radius:9px;margin:2px 0;font-size:14px}.nav-item.active{background:#7660ff1b;color:#c4b9ff}.nav-item svg{width:18px}.sidebar-bottom{margin-top:auto}.engine{background:#14171c;border:1px solid #292d36;border-radius:11px;padding:13px}.engine-row{display:flex;justify-content:space-between;align-items:center;font-size:13px}.dot{width:8px;height:8px;background:var(--green);border-radius:50%;box-shadow:0 0 12px var(--green)}.engine small{display:block;color:var(--muted);margin-top:7px}
+    .content{min-width:0}.topbar{height:72px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 32px;background:#0a0c0fdd;backdrop-filter:blur(12px);position:sticky;top:0;z-index:5}.topbar h2{font-size:17px;margin:0}.top-actions{display:flex;gap:10px}.ghost{border:1px solid #30343e;background:#16181e;color:#d5d7dd;border-radius:9px;padding:9px 13px}.ghost:hover{background:#20232b}.danger{border:1px solid #542c34;background:#251419;color:#ff9ca5;border-radius:8px;padding:8px 11px}
+    main{padding:30px 32px 60px;max-width:1440px}.heading{display:flex;justify-content:space-between;gap:20px;align-items:flex-end;margin-bottom:24px}.heading h1{font-size:28px;margin:0 0 7px}.heading p{color:var(--muted);margin:0}.button-row{display:flex;gap:10px}.stats{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:14px;margin-bottom:24px}.stat{background:linear-gradient(145deg,#15171d,#111318);border:1px solid var(--line);border-radius:14px;padding:18px}.stat-label{color:var(--muted);font-size:13px}.stat-value{font-size:29px;font-weight:800;margin:12px 0 3px}.stat-foot{font-size:12px;color:#6f7480}.stat-icon{float:right;width:34px;height:34px;border-radius:9px;display:grid;place-items:center;background:#765cff1b;color:#aa9cff}
+    .panel{background:var(--panel);border:1px solid var(--line);border-radius:15px;overflow:hidden}.panel-head{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid var(--line)}.panel-head h3{margin:0;font-size:15px}.panel-head span{font-size:12px;color:var(--muted)}.account-list{min-height:230px}.account-row{display:grid;grid-template-columns:minmax(220px,1.5fr) minmax(130px,.8fr) 120px 180px;align-items:center;gap:18px;padding:17px 20px;border-bottom:1px solid #22252d}.account-row:last-child{border-bottom:0}.identity{display:flex;align-items:center;gap:12px;min-width:0}.avatar{width:38px;height:38px;border-radius:10px;background:linear-gradient(145deg,#292d38,#1c1f27);display:grid;place-items:center;color:#c8cbd4;font-weight:800}.identity strong,.identity small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.identity small,.cell-muted{color:var(--muted);font-size:12px;margin-top:4px}.badge{display:inline-flex;align-items:center;gap:6px;width:max-content;border-radius:99px;padding:5px 9px;font-size:12px;background:#143525;color:#70e3aa}.badge.off{background:#2a2c32;color:#9da1ac}.actions{display:flex;justify-content:flex-end;gap:8px}.empty{display:grid;place-items:center;text-align:center;padding:55px 20px;color:var(--muted)}.empty-icon{font-size:30px;margin-bottom:12px}.loading{height:230px;display:grid;place-items:center;color:var(--muted)}
+    .notice{position:fixed;right:24px;bottom:24px;background:#1b1e25;border:1px solid #353946;border-radius:11px;padding:13px 16px;box-shadow:0 15px 45px #0009;z-index:20;max-width:360px}.notice.error{border-color:#63313a;color:#ffb1b8}
+    dialog{border:1px solid #343844;border-radius:16px;background:#15171d;color:#fff;width:min(500px,calc(100% - 30px));padding:0;box-shadow:0 30px 100px #000c}dialog::backdrop{background:#000b;backdrop-filter:blur(5px)}.modal-head{padding:20px 22px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}.modal-head h3{margin:0}.close{border:0;background:transparent;color:#969ba7;font-size:22px}.modal-body{padding:22px}.modal-body p{color:var(--muted);line-height:1.6}.code{font-size:30px;letter-spacing:6px;font-weight:850;background:#090a0e;border:1px dashed #3f4350;padding:14px;border-radius:10px;text-align:center;margin:17px 0}.login-link{display:block;text-align:center;text-decoration:none}.modal-state{text-align:center;font-size:13px;color:#a99cff;margin-top:16px}
+    @media(max-width:1000px){.stats{grid-template-columns:repeat(2,1fr)}.account-row{grid-template-columns:1fr 110px 160px}.account-provider{display:none}}
+    @media(max-width:760px){.app{display:block}.sidebar{display:none}.topbar{padding:0 18px}main{padding:22px 16px}.heading{display:block}.button-row{margin-top:18px}.stats{grid-template-columns:1fr 1fr}.account-row{grid-template-columns:1fr auto}.account-date{display:none}.actions{grid-column:1/-1;justify-content:flex-start}.topbar .ghost{display:none}}
   </style>
 </head>
-<body><main>
-  <h1>grok-rs</h1><div class="sub">Grok OAuth 多账号池 · Claude Code Anthropic API</div>
-  <div class="bar">
-    <input id="key" type="password" placeholder="管理密钥（仅保存在当前浏览器）">
-    <button onclick="saveKey()">连接</button>
-    <button onclick="login(false)">添加账号</button>
-    <button class="secondary" onclick="login(true)">无痕登录</button>
-  </div>
-  <div id="notice"></div><section id="accounts"></section>
-  <dialog id="loginDialog"><h2>登录 xAI</h2><p>在浏览器完成授权。多账号建议使用无痕窗口。</p><div id="userCode" class="code"></div><p><a id="authUrl" target="_blank" rel="noopener">打开登录页面</a></p><p id="loginState">等待授权…</p><button class="secondary" onclick="loginDialog.close()">关闭</button></dialog>
-</main>
-<script>
-const el=id=>document.getElementById(id); const loginDialog=el('loginDialog');
-el('key').value=sessionStorage.adminKey||'';
-const headers=()=>({'x-admin-key':sessionStorage.adminKey||'', 'content-type':'application/json'});
-function note(s){el('notice').textContent=s}
-async function api(path,opt={}){const r=await fetch(path,{...opt,headers:{...headers(),...(opt.headers||{})}});const t=await r.text();let d;try{d=JSON.parse(t)}catch{d={error:t}}if(!r.ok)throw Error(d.error||r.statusText);return d}
-function saveKey(){sessionStorage.adminKey=el('key').value;load()}
-async function load(){try{const d=await api('/api/admin/accounts');render(d.files||[]);note(`已连接，共 ${d.files?.length||0} 个账号`)}catch(e){note('连接失败：'+e.message)}}
-function render(files){el('accounts').innerHTML=files.map(f=>{const disabled=!!f.disabled;const name=f.name||f.id;const email=f.email||f.label||'xAI OAuth';return `<div class="card account"><div class="info"><div class="name">${esc(email)}</div><div class="meta">${esc(name)}</div></div><span class="pill ${disabled?'off':''}">${disabled?'已停用':'可用'}</span><button class="secondary" onclick='toggle(${JSON.stringify(name)},${!disabled})'>${disabled?'启用':'停用'}</button><button class="danger" onclick='removeAccount(${JSON.stringify(name)})'>删除</button></div>`}).join('')||'<div class="card">暂无账号，请先登录。</div>'}
-const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function toggle(name,disabled){await api('/api/admin/accounts/'+encodeURIComponent(name)+'/status',{method:'PATCH',body:JSON.stringify({disabled})});load()}
-async function removeAccount(name){if(!confirm('删除该账号凭据？'))return;await api('/api/admin/accounts/'+encodeURIComponent(name),{method:'DELETE'});load()}
-async function login(privateMode){try{const d=await api('/api/admin/login',{method:'POST'});el('userCode').textContent=d.user_code||'—';el('authUrl').href=d.url;el('loginState').textContent='等待授权…';loginDialog.showModal();if(privateMode)window.open(d.url,'_blank','noopener,noreferrer');else window.open(d.url,'_blank');poll(d.state)}catch(e){note('启动登录失败：'+e.message)}}
-async function poll(state){for(let i=0;i<180;i++){await new Promise(r=>setTimeout(r,2000));try{const d=await api('/api/admin/login/status?state='+encodeURIComponent(state));const status=d.status||d.state;if(status==='ok'||status==='success'||status==='completed'){el('loginState').textContent='登录成功';load();return}if(status==='error'||d.error){el('loginState').textContent='登录失败：'+(d.error||'unknown');return}}catch(e){el('loginState').textContent='查询状态：'+e.message}}}
-if(sessionStorage.adminKey)load();
-</script></body></html>
+<body>
+  <section id="loginPage" class="login-page">
+    <form id="loginForm" class="login-card">
+      <div class="logo">G</div><h1>欢迎回来</h1><p class="lead">登录 grok-rs 管理后台，管理你的 Grok OAuth 账号池。</p>
+      <label for="password">管理员密码</label><input id="password" class="input" type="password" autocomplete="current-password" required placeholder="请输入部署时设置的密码">
+      <button id="loginButton" class="primary" type="submit">登录管理后台</button><div id="loginError" class="login-error"></div>
+      <div class="security-note"><span>🔒</span><span>密码仅用于本次登录验证；浏览器获得的是 HttpOnly 安全会话，不会保存管理员密码。</span></div>
+    </form>
+  </section>
 
+  <section id="app" class="app hidden">
+    <aside class="sidebar"><div class="brand"><div class="logo">G</div><div><strong>grok-rs</strong><small>Control Center</small></div></div>
+      <div class="nav-title">管理</div><div class="nav-item active">◈ <span>账号池</span></div><div class="nav-item">⌁ <span>API 服务</span></div><div class="nav-item">▱ <span>请求统计</span></div>
+      <div class="nav-title">系统</div><div class="nav-item">⚙ <span>部署设置</span></div>
+      <div class="sidebar-bottom"><div class="engine"><div class="engine-row"><span>Grok Engine</span><span class="dot"></span></div><small>Claude Code API 正常运行</small></div></div>
+    </aside>
+    <div class="content"><header class="topbar"><h2>多账号管理</h2><div class="top-actions"><button class="ghost" onclick="loadAccounts()">刷新</button><button class="ghost" onclick="logout()">退出登录</button></div></header>
+      <main><div class="heading"><div><h1>Grok 账号池</h1><p>添加多个订阅账号，自动刷新凭据并在请求之间调度。</p></div><div class="button-row"><button class="ghost" onclick="startOAuth(true)">无痕登录</button><button class="primary" onclick="startOAuth(false)">＋ 添加账号</button></div></div>
+        <section class="stats"><div class="stat"><div class="stat-icon">◎</div><div class="stat-label">账号总数</div><div id="totalCount" class="stat-value">—</div><div class="stat-foot">OAuth credentials</div></div><div class="stat"><div class="stat-icon">✓</div><div class="stat-label">正常可用</div><div id="activeCount" class="stat-value">—</div><div class="stat-foot">参与请求调度</div></div><div class="stat"><div class="stat-icon">Ⅱ</div><div class="stat-label">已停用</div><div id="disabledCount" class="stat-value">—</div><div class="stat-foot">不会接收请求</div></div><div class="stat"><div class="stat-icon">↻</div><div class="stat-label">自动刷新</div><div class="stat-value" style="color:var(--green)">ON</div><div class="stat-foot">每 15 分钟检查</div></div></section>
+        <section class="panel"><div class="panel-head"><div><h3>账号凭据</h3><span>Token 不会显示在管理页面</span></div><span id="updatedAt"></span></div><div id="accounts" class="account-list"><div class="loading">正在读取账号池…</div></div></section>
+      </main>
+    </div>
+  </section>
+
+  <dialog id="oauthDialog"><div class="modal-head"><h3>登录 xAI 账号</h3><button class="close" onclick="oauthDialog.close()">×</button></div><div class="modal-body"><p>请在新窗口中完成 xAI 授权。添加第二个账号时，推荐使用无痕窗口，避免复用当前登录状态。</p><div id="userCode" class="code">—</div><a id="authUrl" class="primary login-link" target="_blank" rel="noopener noreferrer">打开 xAI 登录页面</a><div id="oauthState" class="modal-state">正在准备登录…</div></div></dialog>
+  <div id="notice" class="notice hidden"></div>
+
+  <script>
+    const $=id=>document.getElementById(id), oauthDialog=$('oauthDialog');
+    async function request(path,options={}){const response=await fetch(path,{credentials:'same-origin',...options,headers:{'content-type':'application/json',...(options.headers||{})}});const text=await response.text();let data={};try{data=text?JSON.parse(text):{}}catch{data={error:text}}if(response.status===401&&path!='/api/auth/login'){showLogin();throw Error('登录已过期')}if(!response.ok)throw Error(data.error||response.statusText);return data}
+    function showLogin(){$('app').classList.add('hidden');$('loginPage').classList.remove('hidden');$('password').focus()}
+    function showApp(){$('loginPage').classList.add('hidden');$('app').classList.remove('hidden');loadAccounts()}
+    $('loginForm').addEventListener('submit',async event=>{event.preventDefault();$('loginError').textContent='';$('loginButton').disabled=true;try{await request('/api/auth/login',{method:'POST',body:JSON.stringify({password:$('password').value})});$('password').value='';showApp()}catch(error){$('loginError').textContent=error.message}finally{$('loginButton').disabled=false}})
+    async function logout(){await request('/api/auth/logout',{method:'POST'}).catch(()=>{});showLogin()}
+    function toast(message,error=false){const node=$('notice');node.textContent=message;node.className='notice'+(error?' error':'');setTimeout(()=>node.classList.add('hidden'),3200)}
+    async function loadAccounts(){try{const data=await request('/api/admin/accounts');const files=data.files||[];renderAccounts(files);$('totalCount').textContent=files.length;$('activeCount').textContent=files.filter(item=>!item.disabled).length;$('disabledCount').textContent=files.filter(item=>item.disabled).length;$('updatedAt').textContent='更新于 '+new Date().toLocaleTimeString()}catch(error){toast(error.message,true)}}
+    function renderAccounts(files){const root=$('accounts');root.replaceChildren();if(!files.length){const empty=document.createElement('div');empty.className='empty';empty.innerHTML='<div><div class="empty-icon">◎</div><strong>还没有 Grok 账号</strong><p>点击“添加账号”完成第一次 OAuth 登录。</p></div>';root.append(empty);return}for(const item of files){const name=item.name||item.id||'unknown';const email=item.email||item.label||'xAI Account';const row=document.createElement('div');row.className='account-row';const identity=document.createElement('div');identity.className='identity';const avatar=document.createElement('div');avatar.className='avatar';avatar.textContent=email.slice(0,1).toUpperCase();const identityText=document.createElement('div');const strong=document.createElement('strong');strong.textContent=email;const small=document.createElement('small');small.textContent=name;identityText.append(strong,small);identity.append(avatar,identityText);const provider=document.createElement('div');provider.className='account-provider';provider.innerHTML='<div>xAI OAuth</div><div class="cell-muted">Grok 4.5</div>';const status=document.createElement('span');status.className='badge'+(item.disabled?' off':'');status.textContent=item.disabled?'● 已停用':'● 正常';const actions=document.createElement('div');actions.className='actions';const toggle=document.createElement('button');toggle.className='ghost';toggle.textContent=item.disabled?'启用':'停用';toggle.onclick=()=>setStatus(name,!item.disabled);const remove=document.createElement('button');remove.className='danger';remove.textContent='删除';remove.onclick=()=>removeAccount(name);actions.append(toggle,remove);row.append(identity,provider,status,actions);root.append(row)}}
+    async function setStatus(name,disabled){try{await request('/api/admin/accounts/'+encodeURIComponent(name)+'/status',{method:'PATCH',body:JSON.stringify({disabled})});toast(disabled?'账号已停用':'账号已启用');loadAccounts()}catch(error){toast(error.message,true)}}
+    async function removeAccount(name){if(!confirm('确定删除这个账号凭据吗？此操作不可撤销。'))return;try{await request('/api/admin/accounts/'+encodeURIComponent(name),{method:'DELETE'});toast('账号已删除');loadAccounts()}catch(error){toast(error.message,true)}}
+    async function startOAuth(privateMode){try{const data=await request('/api/admin/login',{method:'POST'});$('userCode').textContent=data.user_code||'—';$('authUrl').href=data.url;$('oauthState').textContent='等待账号授权…';oauthDialog.showModal();window.open(data.url,'_blank',privateMode?'noopener,noreferrer':'noopener');pollOAuth(data.state)}catch(error){toast('启动登录失败：'+error.message,true)}}
+    async function pollOAuth(state){for(let i=0;i<900;i++){await new Promise(resolve=>setTimeout(resolve,2000));if(!oauthDialog.open)return;try{const data=await request('/api/admin/login/status?state='+encodeURIComponent(state));const value=data.status||data.state;if(['ok','success','completed'].includes(value)){$('oauthState').textContent='✓ 登录成功，账号已加入调度池';loadAccounts();setTimeout(()=>oauthDialog.close(),1300);return}if(value==='error'||data.error){$('oauthState').textContent='登录失败：'+(data.error||'unknown');return}}catch(error){$('oauthState').textContent='状态查询失败：'+error.message;return}}}
+    request('/api/auth/session').then(data=>data.authenticated?showApp():showLogin()).catch(showLogin);
+  </script>
+</body>
+</html>
