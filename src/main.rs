@@ -34,6 +34,7 @@ const SESSION_COOKIE: &str = "grok_admin_session";
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const LOGIN_WINDOW: Duration = Duration::from_secs(10 * 60);
 const MAX_LOGIN_FAILURES: usize = 5;
+const ACCOUNT_QUOTA_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
 struct AppState {
@@ -45,11 +46,36 @@ struct AppState {
     issued_keys_path: PathBuf,
     usage: Arc<Mutex<Vec<KeyUsage>>>,
     usage_path: PathBuf,
+    auth_dir: PathBuf,
+    account_quota_cache: Arc<Mutex<HashMap<String, CachedAccountQuota>>>,
     admin_password_hash: [u8; 32],
     cookie_secure: bool,
     sessions: Arc<Mutex<HashMap<String, Instant>>>,
     login_failures: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
     child: Arc<Mutex<Option<Child>>>,
+}
+
+#[derive(Clone)]
+struct CachedAccountQuota {
+    fetched_at: Instant,
+    quota: AccountQuota,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountQuota {
+    name: String,
+    email: String,
+    subscription_tier: Option<String>,
+    used_percent: Option<f64>,
+    remaining_percent: Option<f64>,
+    period_type: Option<String>,
+    period_start: Option<String>,
+    period_end: Option<String>,
+    on_demand_cap: Option<i64>,
+    on_demand_used: Option<i64>,
+    fetched_at: u64,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -165,6 +191,8 @@ async fn main() -> Result<()> {
     );
     let issued_keys = load_issued_keys(&issued_keys_path).await?;
     let usage = load_usage(&usage_path).await?;
+    let auth_dir =
+        PathBuf::from(env::var("GROK_AUTH_DIR").unwrap_or_else(|_| "/data/auth".to_string()));
     let child = start_engine_if_configured(&management_key, &public_api_key).await?;
     let state = AppState {
         client: Client::builder()
@@ -177,6 +205,8 @@ async fn main() -> Result<()> {
         issued_keys_path,
         usage: Arc::new(Mutex::new(usage)),
         usage_path,
+        auth_dir,
+        account_quota_cache: Arc::new(Mutex::new(HashMap::new())),
         admin_password_hash: Sha256::digest(admin_password.as_bytes()).into(),
         cookie_secure,
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -193,6 +223,7 @@ async fn main() -> Result<()> {
         .route("/api/auth/login", post(admin_login))
         .route("/api/auth/logout", post(admin_logout))
         .route("/api/admin/accounts", get(list_accounts))
+        .route("/api/admin/account-quotas", get(list_account_quotas))
         .route("/api/admin/accounts/{name}", delete(delete_account))
         .route(
             "/api/admin/accounts/{name}/status",
@@ -578,6 +609,169 @@ async fn list_accounts(State(state): State<AppState>, headers: HeaderMap) -> Res
         return unauthorized();
     }
     management_request(&state, Method::GET, "/v0/management/auth-files", None).await
+}
+
+async fn list_account_quotas(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+
+    let mut entries = match tokio::fs::read_dir(&state.auth_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return axum::Json(Vec::<AccountQuota>::new()).into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": format!("读取账号凭据目录失败: {error}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut credentials = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("xai") {
+            continue;
+        }
+        let Some(access_token) = value
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.trim().is_empty())
+        else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("unknown.json")
+            .to_string();
+        let email = value
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        credentials.push((name, email, access_token.to_string()));
+    }
+
+    let now = Instant::now();
+    let cached = state.account_quota_cache.lock().await.clone();
+    let mut quotas = Vec::with_capacity(credentials.len());
+    for (name, email, access_token) in credentials {
+        if let Some(item) = cached.get(&name)
+            && now.duration_since(item.fetched_at) < ACCOUNT_QUOTA_CACHE_TTL
+        {
+            quotas.push(item.quota.clone());
+            continue;
+        }
+        let quota = fetch_account_quota(&state.client, name.clone(), email, &access_token).await;
+        if quota.error.is_none() {
+            state.account_quota_cache.lock().await.insert(
+                name,
+                CachedAccountQuota {
+                    fetched_at: Instant::now(),
+                    quota: quota.clone(),
+                },
+            );
+        }
+        quotas.push(quota);
+    }
+    quotas.sort_by(|a, b| a.email.cmp(&b.email).then_with(|| a.name.cmp(&b.name)));
+    axum::Json(quotas).into_response()
+}
+
+async fn fetch_account_quota(
+    client: &Client,
+    name: String,
+    email: String,
+    access_token: &str,
+) -> AccountQuota {
+    let request = |path: &'static str| {
+        client
+            .get(format!("https://cli-chat-proxy.grok.com/v1/{path}"))
+            .bearer_auth(access_token)
+            .header("X-XAI-Token-Auth", "xai-grok-cli")
+            .header("User-Agent", "xai-grok-workspace/0.2.102")
+            .header(header::ACCEPT, "application/json")
+    };
+    let (billing_result, settings_result) = tokio::join!(
+        request("billing?format=credits").send(),
+        request("settings").send()
+    );
+
+    let mut quota = AccountQuota {
+        name,
+        email,
+        subscription_tier: None,
+        used_percent: None,
+        remaining_percent: None,
+        period_type: None,
+        period_start: None,
+        period_end: None,
+        on_demand_cap: None,
+        on_demand_used: None,
+        fetched_at: unix_seconds(),
+        error: None,
+    };
+
+    match billing_result {
+        Ok(response) if response.status().is_success() => match response.json::<Value>().await {
+            Ok(value) => apply_billing_value(&mut quota, &value),
+            Err(error) => quota.error = Some(format!("额度响应解析失败: {error}")),
+        },
+        Ok(response) => quota.error = Some(format!("额度接口返回 HTTP {}", response.status())),
+        Err(error) => quota.error = Some(format!("额度接口请求失败: {error}")),
+    }
+    if let Ok(response) = settings_result
+        && response.status().is_success()
+        && let Ok(value) = response.json::<Value>().await
+    {
+        quota.subscription_tier = value
+            .get("subscription_tier_display")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    quota
+}
+
+fn cent_value(value: &Value, pointer: &str) -> Option<i64> {
+    value.pointer(pointer)?.get("val")?.as_i64()
+}
+
+fn apply_billing_value(quota: &mut AccountQuota, value: &Value) {
+    let config = value.get("config").unwrap_or(value);
+    quota.used_percent = config
+        .get("creditUsagePercent")
+        .and_then(Value::as_f64)
+        .map(|value| value.clamp(0.0, 100.0));
+    quota.remaining_percent = quota.used_percent.map(|value| 100.0 - value);
+    quota.period_type = config
+        .pointer("/currentPeriod/type")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    quota.period_start = config
+        .pointer("/currentPeriod/start")
+        .or_else(|| config.get("billingPeriodStart"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    quota.period_end = config
+        .pointer("/currentPeriod/end")
+        .or_else(|| config.get("billingPeriodEnd"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    quota.on_demand_cap = cent_value(config, "/onDemandCap");
+    quota.on_demand_used = cent_value(config, "/onDemandUsed");
 }
 
 async fn start_login(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1090,7 +1284,11 @@ async fn shutdown_signal(state: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{UsageDelta, extract_usage_delta, remove_top_level_yaml_section};
+    use super::{
+        AccountQuota, UsageDelta, apply_billing_value, extract_usage_delta,
+        remove_top_level_yaml_section,
+    };
+    use serde_json::json;
 
     #[test]
     fn removes_model_alias_without_removing_following_settings() {
@@ -1140,5 +1338,45 @@ mod tests {
                 cache_read_input_tokens: 20,
             })
         );
+    }
+
+    #[test]
+    fn parses_grok_weekly_account_quota() {
+        let mut quota = AccountQuota {
+            name: "xai-test.json".to_string(),
+            email: "test@example.com".to_string(),
+            subscription_tier: None,
+            used_percent: None,
+            remaining_percent: None,
+            period_type: None,
+            period_start: None,
+            period_end: None,
+            on_demand_cap: None,
+            on_demand_used: None,
+            fetched_at: 0,
+            error: None,
+        };
+        apply_billing_value(
+            &mut quota,
+            &json!({"config": {
+                "creditUsagePercent": 51.0,
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-07-15T05:30:28Z",
+                    "end": "2026-07-22T05:30:28Z"
+                },
+                "onDemandCap": {"val": 250000},
+                "onDemandUsed": {"val": 1200}
+            }}),
+        );
+
+        assert_eq!(quota.used_percent, Some(51.0));
+        assert_eq!(quota.remaining_percent, Some(49.0));
+        assert_eq!(
+            quota.period_type.as_deref(),
+            Some("USAGE_PERIOD_TYPE_WEEKLY")
+        );
+        assert_eq!(quota.on_demand_cap, Some(250000));
+        assert_eq!(quota.on_demand_used, Some(1200));
     }
 }
