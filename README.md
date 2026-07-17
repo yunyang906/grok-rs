@@ -19,6 +19,8 @@ docker pull ghcr.io/yunyang906/grok-rs:latest
 
 打开 `http://localhost:8991`，使用 `ADMIN_PASSWORD` 登录后台后添加一个或多个 xAI 账号。登录成功后服务端会签发 HttpOnly 会话 Cookie，管理员密码不会保存在浏览器。登录凭据保存在 `/data/auth`，生产部署必须挂载持久卷到 `/data`。
 
+后台的“用户与 API Keys”页面可以签发独立访问 Key。每个 Key 支持首次调用后开始计算有效期、复制、停用和删除；主 `API_KEY` 始终保留为管理员自用密钥。用户 Key 保存在 `/data/api_keys.json`，不会写入日志。
+
 > 本地 HTTP 测试需要设置 `COOKIE_SECURE=false`；Zeabur 等公网 HTTPS 部署保持默认的 `true`。
 
 Claude Code 配置：
@@ -28,11 +30,15 @@ Claude Code 配置：
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8991",
     "ANTHROPIC_AUTH_TOKEN": "sk-your-api-key",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-5-20251101"
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "grok-4.5"
   },
-  "model": "claude-opus-4-5-20251101"
+  "model": "grok-4.5"
 }
 ```
+
+服务不会创建 Claude 模型别名，也不会把模型名称映射为其他值。客户端应直接使用 `/v1/models` 返回的实际 Grok 模型名称，例如 `grok-4.5`。
+
+为其他使用者配置 Claude Code 时，把 `ANTHROPIC_AUTH_TOKEN` 换成后台签发的用户 Key 即可；所有用户仍使用同一个公网 `ANTHROPIC_BASE_URL`。
 
 ## Zeabur
 

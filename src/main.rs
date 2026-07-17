@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -39,6 +39,9 @@ struct AppState {
     client: Client,
     engine_url: String,
     management_key: String,
+    public_api_key: String,
+    issued_keys: Arc<Mutex<Vec<IssuedApiKey>>>,
+    issued_keys_path: PathBuf,
     admin_password_hash: [u8; 32],
     cookie_secure: bool,
     sessions: Arc<Mutex<HashMap<String, Instant>>>,
@@ -54,6 +57,35 @@ struct LoginStatusQuery {
 #[derive(Deserialize)]
 struct AccountStatus {
     disabled: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssuedApiKey {
+    id: u64,
+    key: String,
+    name: String,
+    enabled: bool,
+    created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_days: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activated_at: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateIssuedKeyRequest {
+    name: String,
+    duration_days: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct UpdateIssuedKeyRequest {
+    name: Option<String>,
+    enabled: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -79,18 +111,26 @@ async fn main() -> Result<()> {
     let engine_url =
         env::var("GROK_ENGINE_URL").unwrap_or_else(|_| "http://127.0.0.1:8318".to_string());
     let management_key = required_secret("GROK_MANAGEMENT_KEY")?;
+    let public_api_key = required_secret("API_KEY")?;
     let admin_password = required_secret("ADMIN_PASSWORD")?;
     let cookie_secure = env::var("COOKIE_SECURE")
         .map(|value| value != "false" && value != "0")
         .unwrap_or(true);
 
-    let child = start_engine_if_configured(&management_key).await?;
+    let issued_keys_path = PathBuf::from(
+        env::var("API_KEYS_FILE").unwrap_or_else(|_| "/data/api_keys.json".to_string()),
+    );
+    let issued_keys = load_issued_keys(&issued_keys_path).await?;
+    let child = start_engine_if_configured(&management_key, &public_api_key).await?;
     let state = AppState {
         client: Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build()?,
         engine_url,
         management_key,
+        public_api_key,
+        issued_keys: Arc::new(Mutex::new(issued_keys)),
+        issued_keys_path,
         admin_password_hash: Sha256::digest(admin_password.as_bytes()).into(),
         cookie_secure,
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -114,6 +154,14 @@ async fn main() -> Result<()> {
         )
         .route("/api/admin/login", post(start_login))
         .route("/api/admin/login/status", get(login_status))
+        .route(
+            "/api/admin/api-keys",
+            get(list_issued_keys).post(create_issued_key),
+        )
+        .route(
+            "/api/admin/api-keys/{id}",
+            patch(update_issued_key).delete(delete_issued_key),
+        )
         .route("/v1/{*path}", any(proxy_v1))
         .route("/cc/{*path}", any(proxy_cc))
         .layer(middleware::from_fn(security_headers))
@@ -140,7 +188,10 @@ fn required_secret(name: &str) -> Result<String> {
     Ok(value)
 }
 
-async fn start_engine_if_configured(management_key: &str) -> Result<Option<Child>> {
+async fn start_engine_if_configured(
+    management_key: &str,
+    public_api_key: &str,
+) -> Result<Option<Child>> {
     let bin = env::var("GROK_ENGINE_BIN").unwrap_or_default();
     if bin.is_empty() {
         tracing::info!("GROK_ENGINE_BIN is unset; using an externally managed engine");
@@ -150,7 +201,7 @@ async fn start_engine_if_configured(management_key: &str) -> Result<Option<Child
     let config_path = PathBuf::from(
         env::var("GROK_ENGINE_CONFIG").unwrap_or_else(|_| "/data/engine.yaml".to_string()),
     );
-    ensure_engine_config(&config_path, management_key).await?;
+    ensure_engine_config(&config_path, management_key, public_api_key).await?;
 
     let child = tokio::process::Command::new(&bin)
         .arg("-config")
@@ -163,21 +214,33 @@ async fn start_engine_if_configured(management_key: &str) -> Result<Option<Child
     Ok(Some(child))
 }
 
-async fn ensure_engine_config(path: &Path, management_key: &str) -> Result<()> {
+async fn ensure_engine_config(
+    path: &Path,
+    management_key: &str,
+    public_api_key: &str,
+) -> Result<()> {
     if path.exists() {
+        let existing = tokio::fs::read_to_string(path).await?;
+        let migrated = remove_top_level_yaml_section(&existing, "oauth-model-alias");
+        if migrated != existing {
+            tokio::fs::write(path, migrated).await?;
+            tracing::info!(
+                path = %path.display(),
+                "removed legacy model aliases; upstream model names are now used directly"
+            );
+        }
         return Ok(());
     }
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let public_key = required_secret("API_KEY")?;
     let auth_dir = env::var("GROK_AUTH_DIR").unwrap_or_else(|_| "/data/auth".to_string());
     let config = format!(
         r#"host: "127.0.0.1"
 port: 8318
 auth-dir: "{auth_dir}"
 api-keys:
-  - "{public_key}"
+  - "{public_api_key}"
 remote-management:
   allow-remote: false
   secret-key: "{management_key}"
@@ -186,16 +249,73 @@ debug: false
 logging-to-file: false
 usage-statistics-enabled: false
 request-retry: 2
-oauth-model-alias:
-  xai:
-    - name: "grok-4.5"
-      alias: "claude-opus-4-5-20251101"
-      fork: true
-      force-mapping: true
 "#
     );
     tokio::fs::write(path, config).await?;
     Ok(())
+}
+
+async fn load_issued_keys(path: &Path) -> Result<Vec<IssuedApiKey>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = tokio::fs::read_to_string(path).await?;
+    if content.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&content).context("invalid issued API key file")
+}
+
+async fn save_issued_keys(path: &Path, keys: &[IssuedApiKey]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    tokio::fs::write(&temporary, serde_json::to_vec_pretty(keys)?).await?;
+    tokio::fs::rename(temporary, path).await?;
+    Ok(())
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn generate_issued_key() -> String {
+    let mut bytes = [0_u8; 24];
+    rand::rng().fill_bytes(&mut bytes);
+    format!("sk-{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn remove_top_level_yaml_section(input: &str, section: &str) -> String {
+    let section_header = format!("{section}:");
+    let mut skipping = false;
+    let mut kept = Vec::new();
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+        let is_top_level =
+            !line.starts_with([' ', '\t']) && !trimmed.is_empty() && !trimmed.starts_with('#');
+
+        if !skipping && is_top_level && trimmed == section_header {
+            skipping = true;
+            continue;
+        }
+        if skipping && is_top_level {
+            skipping = false;
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+
+    let mut result = kept.join("\n");
+    if input.ends_with('\n') && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 async fn wait_for_engine(state: &AppState) -> Result<()> {
@@ -446,6 +566,201 @@ async fn set_account_status(
     .await
 }
 
+async fn list_issued_keys(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    axum::Json(state.issued_keys.lock().await.clone()).into_response()
+}
+
+async fn create_issued_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(payload): axum::Json<CreateIssuedKeyRequest>,
+) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    let name = payload.name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "用户名称必须为 1–80 个字符"})),
+        )
+            .into_response();
+    }
+    if payload
+        .duration_days
+        .is_some_and(|days| !days.is_finite() || days <= 0.0 || days > 3650.0)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "有效期必须大于 0 且不超过 3650 天"})),
+        )
+            .into_response();
+    }
+
+    let mut keys = state.issued_keys.lock().await;
+    let issued = IssuedApiKey {
+        id: keys.iter().map(|key| key.id).max().unwrap_or(0) + 1,
+        key: generate_issued_key(),
+        name: name.to_string(),
+        enabled: true,
+        created_at: unix_seconds(),
+        expires_at: None,
+        duration_days: payload.duration_days,
+        activated_at: None,
+    };
+    keys.push(issued.clone());
+    if let Err(error) = save_issued_keys(&state.issued_keys_path, &keys).await {
+        keys.pop();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+    (StatusCode::CREATED, axum::Json(issued)).into_response()
+}
+
+async fn update_issued_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<u64>,
+    axum::Json(payload): axum::Json<UpdateIssuedKeyRequest>,
+) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    if payload.name.as_ref().is_some_and(|name| {
+        let length = name.trim().chars().count();
+        length == 0 || length > 80
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "用户名称必须为 1–80 个字符"})),
+        )
+            .into_response();
+    }
+
+    let mut keys = state.issued_keys.lock().await;
+    let Some(index) = keys.iter().position(|key| key.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": "API Key 不存在"})),
+        )
+            .into_response();
+    };
+    let previous = keys[index].clone();
+    if let Some(name) = payload.name {
+        keys[index].name = name.trim().to_string();
+    }
+    if let Some(enabled) = payload.enabled {
+        keys[index].enabled = enabled;
+    }
+    let updated = keys[index].clone();
+    if let Err(error) = save_issued_keys(&state.issued_keys_path, &keys).await {
+        keys[index] = previous;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+    axum::Json(updated).into_response()
+}
+
+async fn delete_issued_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<u64>,
+) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    let mut keys = state.issued_keys.lock().await;
+    let Some(index) = keys.iter().position(|key| key.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": "API Key 不存在"})),
+        )
+            .into_response();
+    };
+    let removed = keys.remove(index);
+    if let Err(error) = save_issued_keys(&state.issued_keys_path, &keys).await {
+        keys.insert(index, removed);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+    axum::Json(json!({"ok": true})).into_response()
+}
+
+fn request_api_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+    {
+        return Some(value.trim().to_string());
+    }
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(|value| value.trim().to_string())
+}
+
+async fn authorize_api_request(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<(), (StatusCode, &'static str)> {
+    let supplied = request_api_key(headers).ok_or((StatusCode::UNAUTHORIZED, "Missing API key"))?;
+    if bool::from(supplied.as_bytes().ct_eq(state.public_api_key.as_bytes())) {
+        return Ok(());
+    }
+
+    let mut keys = state.issued_keys.lock().await;
+    let Some(index) = keys
+        .iter()
+        .position(|key| bool::from(supplied.as_bytes().ct_eq(key.key.as_bytes())))
+    else {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid API key"));
+    };
+    if !keys[index].enabled {
+        return Err((StatusCode::FORBIDDEN, "API key is disabled"));
+    }
+    let now = unix_seconds();
+    if keys[index].expires_at.is_some_and(|expires| expires <= now) {
+        return Err((StatusCode::FORBIDDEN, "API key has expired"));
+    }
+    if keys[index].duration_days.is_some() && keys[index].activated_at.is_none() {
+        let lifetime = (keys[index].duration_days.unwrap() * 86_400.0).round() as u64;
+        keys[index].activated_at = Some(now);
+        keys[index].expires_at = Some(now.saturating_add(lifetime));
+        if let Err(error) = save_issued_keys(&state.issued_keys_path, &keys).await {
+            tracing::error!(%error, id = keys[index].id, "failed to persist API key activation");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to activate API key",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn api_auth_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        axum::Json(json!({
+            "type": "error",
+            "error": {"type": "authentication_error", "message": message}
+        })),
+    )
+        .into_response()
+}
+
 async fn proxy_v1(State(state): State<AppState>, request: Request) -> Response {
     proxy_request(state, request).await
 }
@@ -456,6 +771,9 @@ async fn proxy_cc(State(state): State<AppState>, request: Request) -> Response {
 
 async fn proxy_request(state: AppState, request: Request) -> Response {
     let (parts, body) = request.into_parts();
+    if let Err((status, message)) = authorize_api_request(&state, &parts.headers).await {
+        return api_auth_error(status, message);
+    }
     let suffix = parts
         .uri
         .path_and_query()
@@ -470,11 +788,17 @@ async fn proxy_request(state: AppState, request: Request) -> Response {
     };
     let mut upstream = state.client.request(parts.method, target).body(bytes);
     for (name, value) in &parts.headers {
-        if name.as_str().eq_ignore_ascii_case("host") {
+        if name.as_str().eq_ignore_ascii_case("host")
+            || name.as_str().eq_ignore_ascii_case("x-api-key")
+            || name.as_str().eq_ignore_ascii_case("authorization")
+        {
             continue;
         }
         upstream = upstream.header(name, value);
     }
+    upstream = upstream
+        .header("x-api-key", &state.public_api_key)
+        .bearer_auth(&state.public_api_key);
     match upstream.send().await {
         Ok(response) => relay_response(response),
         Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
@@ -515,5 +839,27 @@ async fn shutdown_signal(state: AppState) {
     tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
     if let Some(child) = state.child.lock().await.as_mut() {
         let _ = child.kill().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_top_level_yaml_section;
+
+    #[test]
+    fn removes_model_alias_without_removing_following_settings() {
+        let config = concat!(
+            "host: 127.0.0.1\n",
+            "oauth-model-alias:\n",
+            "  xai:\n",
+            "    - name: grok-4.5\n",
+            "      alias: claude-opus-4-5\n",
+            "request-retry: 2\n",
+        );
+
+        assert_eq!(
+            remove_top_level_yaml_section(config, "oauth-model-alias"),
+            "host: 127.0.0.1\nrequest-retry: 2\n"
+        );
     }
 }
