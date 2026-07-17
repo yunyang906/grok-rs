@@ -1511,15 +1511,17 @@ async fn proxy_request(state: AppState, request: Request) -> Response {
             return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
         }
     };
-    let model = serde_json::from_slice::<Value>(&bytes)
+    let body = inject_prompt_cache_key(&bytes, &parts.headers, identity.key_id);
+    let model = serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|value| value.get("model")?.as_str().map(str::to_string))
         .unwrap_or_else(|| "unknown".to_string());
-    let mut upstream = state.client.request(parts.method, target).body(bytes);
+    let mut upstream = state.client.request(parts.method, target).body(body);
     for (name, value) in &parts.headers {
         if name.as_str().eq_ignore_ascii_case("host")
             || name.as_str().eq_ignore_ascii_case("x-api-key")
             || name.as_str().eq_ignore_ascii_case("authorization")
+            || name.as_str().eq_ignore_ascii_case("content-length")
         {
             continue;
         }
@@ -1532,6 +1534,63 @@ async fn proxy_request(state: AppState, request: Request) -> Response {
         Ok(response) => relay_response_with_usage(response, state, identity, model, traffic_lease),
         Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
     }
+}
+
+fn inject_prompt_cache_key(body: &[u8], headers: &HeaderMap, key_id: u64) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    if !value.is_object() {
+        return body.to_vec();
+    }
+
+    let header_hint = [
+        "x-grok-conv-id",
+        "prompt-cache-key",
+        "session-id",
+        "session_id",
+        "x-session-id",
+        "x-claude-session-id",
+    ]
+    .iter()
+    .find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|entry| entry.to_str().ok())
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+    });
+    let body_hint = value
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .or_else(|| {
+            value
+                .pointer("/metadata/user_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+        });
+    let stable_source = header_hint
+        .or(body_hint)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            serde_json::to_string(&json!({
+                "model": value.get("model"),
+                "system": value.get("system"),
+                "tools": value.get("tools"),
+                "first_message": value
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .and_then(|messages| messages.first()),
+            }))
+            .unwrap_or_default()
+        });
+    let digest = Sha256::digest(format!("{key_id}\0{stable_source}").as_bytes());
+    value["prompt_cache_key"] =
+        Value::String(format!("cc_{}", URL_SAFE_NO_PAD.encode(&digest[..18])));
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
 }
 
 fn usage_number(usage: &Value, primary: &str, compatible: &str) -> u64 {
@@ -1567,6 +1626,16 @@ fn merge_usage_value(delta: &mut UsageDelta, value: &Value) -> bool {
         usage
             .get("cache_read_input_tokens")
             .and_then(Value::as_u64)
+            .or_else(|| {
+                usage
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+            })
+            .or_else(|| {
+                usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+            })
             .unwrap_or(0),
     );
     true
@@ -1714,9 +1783,10 @@ async fn shutdown_signal(state: AppState) {
 mod tests {
     use super::{
         AccountQuota, RoutingSettings, TrafficPolicy, UsageDelta, apply_billing_value,
-        apply_routing_settings_to_yaml, extract_usage_delta, remove_top_level_yaml_section,
-        routing_settings_from_config, validate_traffic_policy,
+        apply_routing_settings_to_yaml, extract_usage_delta, inject_prompt_cache_key,
+        remove_top_level_yaml_section, routing_settings_from_config, validate_traffic_policy,
     };
+    use axum::http::HeaderMap;
     use serde_json::json;
 
     #[test]
@@ -1765,6 +1835,40 @@ mod tests {
                 output_tokens: 32,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn injects_stable_isolated_prompt_cache_keys() {
+        let first = br#"{"model":"grok-4.5","system":"stable","messages":[{"role":"user","content":"hello"}]}"#;
+        let second = br#"{"model":"grok-4.5","system":"stable","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"next"}]}"#;
+        let headers = HeaderMap::new();
+        let first: serde_json::Value =
+            serde_json::from_slice(&inject_prompt_cache_key(first, &headers, 7)).unwrap();
+        let second: serde_json::Value =
+            serde_json::from_slice(&inject_prompt_cache_key(second, &headers, 7)).unwrap();
+        let other_user: serde_json::Value = serde_json::from_slice(&inject_prompt_cache_key(
+            first.to_string().as_bytes(),
+            &headers,
+            8,
+        ))
+        .unwrap();
+
+        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        assert_ne!(first["prompt_cache_key"], other_user["prompt_cache_key"]);
+    }
+
+    #[test]
+    fn extracts_xai_cached_token_usage() {
+        let body = br#"{"usage":{"input_tokens":120,"output_tokens":45,"input_tokens_details":{"cached_tokens":80}}}"#;
+        assert_eq!(
+            extract_usage_delta(body),
+            Some(UsageDelta {
+                input_tokens: 120,
+                output_tokens: 45,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 80,
             })
         );
     }

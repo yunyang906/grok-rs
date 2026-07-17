@@ -23,6 +23,8 @@ docker pull ghcr.io/yunyang906/grok-rs:latest
 
 首页会按主 Key 和每个用户 Key 汇总成功请求数、输入 Token、输出 Token、缓存 Token、调用模型和最近使用时间。普通 JSON 响应和 SSE 流式响应均直接读取 Anthropic `usage` 字段，统计结果持久化到 `/data/api_key_usage.json`。历史请求不会被追溯补录，升级后的新请求才开始统计。
 
+网关会为每个 Claude Code 会话生成稳定且按用户 Key 隔离的 `prompt_cache_key`。客户端提供会话 ID 时优先使用；否则根据模型、系统提示、工具定义和首条消息生成稳定哈希。底层执行器会把它同时传给 xAI Responses API 和 `x-grok-conv-id`，提高官方 Prompt Cache 命中率。网关不会缓存完整回答；页面中的缓存 Token 只统计上游实际返回的 `cached_tokens`/`cache_read_input_tokens`。
+
 首页和账号池还会分别显示每个 Grok OAuth 订阅账号的真实额度，包括订阅档位、已用/剩余百分比、额度周期、重置时间和额外用量状态。数据由服务端使用账号凭据请求 Grok CLI Billing 接口，成功结果缓存 5 分钟；access token 和 refresh token 始终不会返回浏览器。
 
 “调度设置”页面可以热更新账号选择策略、会话粘滞时长和失败重试次数，并为每个 OAuth 账号设置 `-100` 至 `100` 的优先级。优先级数值越高越先使用；同一最高优先级内再使用 `round-robin`（均衡轮询）或 `fill-first`（优先用满）策略。账号不可用或进入冷却时会自动故障切换。
