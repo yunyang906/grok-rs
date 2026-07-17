@@ -11,6 +11,12 @@ GROK_MANAGEMENT_KEY=your-internal-key \
 docker compose up -d --build
 ```
 
+也可以直接使用 GitHub Actions 自动构建的多架构镜像：
+
+```bash
+docker pull ghcr.io/yunyang906/grok-rs:latest
+```
+
 打开 `http://localhost:8991`，输入 `ADMIN_API_KEY` 后添加一个或多个 xAI 账号。登录凭据保存在 `/data/auth`，生产部署必须挂载持久卷到 `/data`。
 
 Claude Code 配置：
@@ -36,4 +42,3 @@ Claude Code 配置：
 ## 说明
 
 当前 MVP 使用开源 CLIProxyAPI 作为镜像内 Grok 协议执行器（MIT License），Rust 层负责产品化控制面。后续可以逐步将 OAuth 和 Responses 转换模块原生移植到 Rust，而不改变外部 API 和数据目录。
-
