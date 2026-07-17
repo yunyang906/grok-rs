@@ -21,6 +21,8 @@ docker pull ghcr.io/yunyang906/grok-rs:latest
 
 后台的“用户与 API Keys”页面可以签发独立访问 Key。每个 Key 支持首次调用后开始计算有效期、复制、停用和删除；主 `API_KEY` 始终保留为管理员自用密钥。用户 Key 保存在 `/data/api_keys.json`，不会写入日志。
 
+首页会按主 Key 和每个用户 Key 汇总成功请求数、输入 Token、输出 Token、缓存 Token、调用模型和最近使用时间。普通 JSON 响应和 SSE 流式响应均直接读取 Anthropic `usage` 字段，统计结果持久化到 `/data/api_key_usage.json`。历史请求不会被追溯补录，升级后的新请求才开始统计。
+
 > 本地 HTTP 测试需要设置 `COOKIE_SECURE=false`；Zeabur 等公网 HTTPS 部署保持默认的 `true`。
 
 Claude Code 配置：
