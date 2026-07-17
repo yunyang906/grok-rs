@@ -1,0 +1,16 @@
+services:
+  grok-rs:
+    build: .
+    ports:
+      - "8991:8991"
+    environment:
+      API_KEY: "sk-grok-rs-change-me"
+      ADMIN_API_KEY: "change-this-admin-key"
+      GROK_MANAGEMENT_KEY: "change-this-management-key"
+    volumes:
+      - grok-data:/data
+    restart: unless-stopped
+
+volumes:
+  grok-data:
+

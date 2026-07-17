@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>grok-rs 多账号管理</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui; background:#09090b; color:#f4f4f5 }
+    body { margin:0; min-height:100vh; background:radial-gradient(circle at 20% 0,#1d283a 0,transparent 32%),#09090b }
+    main { max-width:980px; margin:auto; padding:42px 22px }
+    h1 { font-size:34px; margin:0 0 8px } .sub { color:#a1a1aa; margin-bottom:28px }
+    .bar,.card { background:#141417; border:1px solid #29292e; border-radius:14px; padding:16px; box-shadow:0 12px 34px #0007 }
+    .bar { display:flex; gap:10px; flex-wrap:wrap; align-items:center }
+    input,button { border-radius:9px; border:1px solid #34343a; padding:10px 13px; font:inherit }
+    input { flex:1; min-width:220px; background:#0c0c0f; color:#fff } button { background:#7c3aed; color:#fff; cursor:pointer; font-weight:650 }
+    button.secondary { background:#242429 } button.danger { background:#7f1d1d } button:disabled { opacity:.45; cursor:not-allowed }
+    #notice { min-height:24px; color:#c4b5fd; padding:12px 2px }
+    #accounts { display:grid; gap:12px }
+    .account { display:flex; align-items:center; gap:14px }.info { flex:1 }.name { font-weight:700 }.meta { color:#a1a1aa;font-size:13px;margin-top:5px }
+    .pill { border-radius:99px; padding:4px 9px; font-size:12px; background:#14532d }.off { background:#3f3f46 }
+    dialog { border:1px solid #33333a; border-radius:16px; background:#151519; color:#fff; max-width:520px; padding:24px }
+    dialog::backdrop { background:#000b }.code { font-size:28px;letter-spacing:4px;font-weight:800;background:#09090b;padding:12px;border-radius:10px;text-align:center }
+    a { color:#a78bfa } @media(max-width:650px){.account{align-items:flex-start;flex-wrap:wrap}.info{min-width:70%}}
+  </style>
+</head>
+<body><main>
+  <h1>grok-rs</h1><div class="sub">Grok OAuth 多账号池 · Claude Code Anthropic API</div>
+  <div class="bar">
+    <input id="key" type="password" placeholder="管理密钥（仅保存在当前浏览器）">
+    <button onclick="saveKey()">连接</button>
+    <button onclick="login(false)">添加账号</button>
+    <button class="secondary" onclick="login(true)">无痕登录</button>
+  </div>
+  <div id="notice"></div><section id="accounts"></section>
+  <dialog id="loginDialog"><h2>登录 xAI</h2><p>在浏览器完成授权。多账号建议使用无痕窗口。</p><div id="userCode" class="code"></div><p><a id="authUrl" target="_blank" rel="noopener">打开登录页面</a></p><p id="loginState">等待授权…</p><button class="secondary" onclick="loginDialog.close()">关闭</button></dialog>
+</main>
+<script>
+const el=id=>document.getElementById(id); const loginDialog=el('loginDialog');
+el('key').value=sessionStorage.adminKey||'';
+const headers=()=>({'x-admin-key':sessionStorage.adminKey||'', 'content-type':'application/json'});
+function note(s){el('notice').textContent=s}
+async function api(path,opt={}){const r=await fetch(path,{...opt,headers:{...headers(),...(opt.headers||{})}});const t=await r.text();let d;try{d=JSON.parse(t)}catch{d={error:t}}if(!r.ok)throw Error(d.error||r.statusText);return d}
+function saveKey(){sessionStorage.adminKey=el('key').value;load()}
+async function load(){try{const d=await api('/api/admin/accounts');render(d.files||[]);note(`已连接，共 ${d.files?.length||0} 个账号`)}catch(e){note('连接失败：'+e.message)}}
+function render(files){el('accounts').innerHTML=files.map(f=>{const disabled=!!f.disabled;const name=f.name||f.id;const email=f.email||f.label||'xAI OAuth';return `<div class="card account"><div class="info"><div class="name">${esc(email)}</div><div class="meta">${esc(name)}</div></div><span class="pill ${disabled?'off':''}">${disabled?'已停用':'可用'}</span><button class="secondary" onclick='toggle(${JSON.stringify(name)},${!disabled})'>${disabled?'启用':'停用'}</button><button class="danger" onclick='removeAccount(${JSON.stringify(name)})'>删除</button></div>`}).join('')||'<div class="card">暂无账号，请先登录。</div>'}
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function toggle(name,disabled){await api('/api/admin/accounts/'+encodeURIComponent(name)+'/status',{method:'PATCH',body:JSON.stringify({disabled})});load()}
+async function removeAccount(name){if(!confirm('删除该账号凭据？'))return;await api('/api/admin/accounts/'+encodeURIComponent(name),{method:'DELETE'});load()}
+async function login(privateMode){try{const d=await api('/api/admin/login',{method:'POST'});el('userCode').textContent=d.user_code||'—';el('authUrl').href=d.url;el('loginState').textContent='等待授权…';loginDialog.showModal();if(privateMode)window.open(d.url,'_blank','noopener,noreferrer');else window.open(d.url,'_blank');poll(d.state)}catch(e){note('启动登录失败：'+e.message)}}
+async function poll(state){for(let i=0;i<180;i++){await new Promise(r=>setTimeout(r,2000));try{const d=await api('/api/admin/login/status?state='+encodeURIComponent(state));const status=d.status||d.state;if(status==='ok'||status==='success'||status==='completed'){el('loginState').textContent='登录成功';load();return}if(status==='error'||d.error){el('loginState').textContent='登录失败：'+(d.error||'unknown');return}}catch(e){el('loginState').textContent='查询状态：'+e.message}}}
+if(sessionStorage.adminKey)load();
+</script></body></html>
+
