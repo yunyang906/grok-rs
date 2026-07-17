@@ -88,6 +88,20 @@ struct AccountStatus {
     disabled: bool,
 }
 
+#[derive(Deserialize)]
+struct AccountPriority {
+    priority: i32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingSettings {
+    strategy: String,
+    session_affinity: bool,
+    session_affinity_ttl: String,
+    request_retry: u8,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IssuedApiKey {
@@ -228,6 +242,14 @@ async fn main() -> Result<()> {
         .route(
             "/api/admin/accounts/{name}/status",
             patch(set_account_status),
+        )
+        .route(
+            "/api/admin/accounts/{name}/priority",
+            patch(set_account_priority),
+        )
+        .route(
+            "/api/admin/settings/routing",
+            get(get_routing_settings).patch(update_routing_settings),
         )
         .route("/api/admin/login", post(start_login))
         .route("/api/admin/login/status", get(login_status))
@@ -611,6 +633,196 @@ async fn list_accounts(State(state): State<AppState>, headers: HeaderMap) -> Res
     management_request(&state, Method::GET, "/v0/management/auth-files", None).await
 }
 
+async fn get_routing_settings(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    let response = match state
+        .client
+        .get(format!("{}/v0/management/config", state.engine_url))
+        .bearer_auth(&state.management_key)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if !response.status().is_success() {
+        return relay_response(response);
+    }
+    match response.json::<Value>().await {
+        Ok(config) => axum::Json(routing_settings_from_config(&config)).into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(json!({"error": format!("解析引擎配置失败: {error}")})),
+        )
+            .into_response(),
+    }
+}
+
+async fn update_routing_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(payload): axum::Json<RoutingSettings>,
+) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    if let Err(message) = validate_routing_settings(&payload) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": message})),
+        )
+            .into_response();
+    }
+
+    let config_response = match state
+        .client
+        .get(format!("{}/v0/management/config.yaml", state.engine_url))
+        .bearer_auth(&state.management_key)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if !config_response.status().is_success() {
+        return relay_response(config_response);
+    }
+    let current = match config_response.text().await {
+        Ok(current) => current,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({"error": format!("读取引擎配置失败: {error}")})),
+            )
+                .into_response();
+        }
+    };
+    let updated = apply_routing_settings_to_yaml(&current, &payload);
+    let response = match state
+        .client
+        .put(format!("{}/v0/management/config.yaml", state.engine_url))
+        .bearer_auth(&state.management_key)
+        .header(header::CONTENT_TYPE, "application/yaml")
+        .body(updated)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if !response.status().is_success() {
+        return relay_response(response);
+    }
+    axum::Json(payload).into_response()
+}
+
+fn routing_settings_from_config(config: &Value) -> RoutingSettings {
+    let strategy = config
+        .pointer("/routing/strategy")
+        .and_then(Value::as_str)
+        .filter(|value| *value == "fill-first")
+        .unwrap_or("round-robin")
+        .to_string();
+    let session_affinity = config
+        .pointer("/routing/session-affinity")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let session_affinity_ttl = config
+        .pointer("/routing/session-affinity-ttl")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("1h")
+        .to_string();
+    let request_retry = config
+        .get("request-retry")
+        .and_then(Value::as_u64)
+        .unwrap_or(2)
+        .min(10) as u8;
+    RoutingSettings {
+        strategy,
+        session_affinity,
+        session_affinity_ttl,
+        request_retry,
+    }
+}
+
+fn validate_routing_settings(settings: &RoutingSettings) -> std::result::Result<(), &'static str> {
+    if settings.strategy != "round-robin" && settings.strategy != "fill-first" {
+        return Err("不支持的调度模式");
+    }
+    if !matches!(
+        settings.session_affinity_ttl.as_str(),
+        "30m" | "1h" | "2h" | "6h" | "12h" | "24h"
+    ) {
+        return Err("不支持的会话粘滞时长");
+    }
+    if settings.request_retry > 10 {
+        return Err("重试次数不能超过 10");
+    }
+    Ok(())
+}
+
+fn remove_top_level_yaml_key(input: &str, key: &str) -> String {
+    let mut skipping = false;
+    let mut kept = Vec::new();
+    for line in input.lines() {
+        let trimmed = line.trim();
+        let top_level =
+            !line.starts_with([' ', '\t']) && !trimmed.is_empty() && !trimmed.starts_with('#');
+        if top_level {
+            let line_key = trimmed.split_once(':').map(|(key, _)| key.trim());
+            if line_key == Some(key) {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                skipping = false;
+            }
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+    let mut result = kept.join("\n");
+    if !result.is_empty() && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+fn apply_routing_settings_to_yaml(input: &str, settings: &RoutingSettings) -> String {
+    let without_routing = remove_top_level_yaml_key(input, "routing");
+    let mut output = remove_top_level_yaml_key(&without_routing, "request-retry");
+    output.push_str(&format!(
+        "request-retry: {}\nrouting:\n  strategy: {}\n  session-affinity: {}\n  session-affinity-ttl: \"{}\"\n",
+        settings.request_retry,
+        settings.strategy,
+        settings.session_affinity,
+        settings.session_affinity_ttl
+    ));
+    output
+}
+
 async fn list_account_quotas(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if authorize_admin(&headers, &state).await.is_err() {
         return unauthorized();
@@ -825,6 +1037,31 @@ async fn set_account_status(
         Method::PATCH,
         "/v0/management/auth-files/status",
         Some(json!({"name": name, "disabled": payload.disabled})),
+    )
+    .await
+}
+
+async fn set_account_priority(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    axum::Json(payload): axum::Json<AccountPriority>,
+) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    if !(-100..=100).contains(&payload.priority) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "优先级必须在 -100 到 100 之间"})),
+        )
+            .into_response();
+    }
+    management_request(
+        &state,
+        Method::PATCH,
+        "/v0/management/auth-files/fields",
+        Some(json!({"name": name, "priority": payload.priority})),
     )
     .await
 }
@@ -1285,8 +1522,9 @@ async fn shutdown_signal(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountQuota, UsageDelta, apply_billing_value, extract_usage_delta,
-        remove_top_level_yaml_section,
+        AccountQuota, RoutingSettings, UsageDelta, apply_billing_value,
+        apply_routing_settings_to_yaml, extract_usage_delta, remove_top_level_yaml_section,
+        routing_settings_from_config,
     };
     use serde_json::json;
 
@@ -1378,5 +1616,57 @@ mod tests {
         );
         assert_eq!(quota.on_demand_cap, Some(250000));
         assert_eq!(quota.on_demand_used, Some(1200));
+    }
+
+    #[test]
+    fn replaces_routing_yaml_without_touching_secrets() {
+        let config = concat!(
+            "api-keys:\n",
+            "  - secret-key\n",
+            "request-retry: 2\n",
+            "routing:\n",
+            "  strategy: fill-first\n",
+            "  session-affinity: false\n",
+            "debug: false\n",
+        );
+        let updated = apply_routing_settings_to_yaml(
+            config,
+            &RoutingSettings {
+                strategy: "round-robin".to_string(),
+                session_affinity: true,
+                session_affinity_ttl: "2h".to_string(),
+                request_retry: 3,
+            },
+        );
+
+        assert!(updated.contains("  - secret-key\n"));
+        assert!(updated.contains("debug: false\n"));
+        assert!(updated.contains("request-retry: 3\n"));
+        assert!(updated.contains("  strategy: round-robin\n"));
+        assert!(updated.contains("  session-affinity: true\n"));
+        assert!(updated.contains("  session-affinity-ttl: \"2h\"\n"));
+        assert_eq!(updated.matches("routing:").count(), 1);
+    }
+
+    #[test]
+    fn reads_routing_defaults_and_values() {
+        let defaults = routing_settings_from_config(&json!({}));
+        assert_eq!(defaults.strategy, "round-robin");
+        assert!(!defaults.session_affinity);
+        assert_eq!(defaults.session_affinity_ttl, "1h");
+        assert_eq!(defaults.request_retry, 2);
+
+        let configured = routing_settings_from_config(&json!({
+            "request-retry": 4,
+            "routing": {
+                "strategy": "fill-first",
+                "session-affinity": true,
+                "session-affinity-ttl": "6h"
+            }
+        }));
+        assert_eq!(configured.strategy, "fill-first");
+        assert!(configured.session_affinity);
+        assert_eq!(configured.session_affinity_ttl, "6h");
+        assert_eq!(configured.request_retry, 4);
     }
 }

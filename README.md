@@ -25,6 +25,8 @@ docker pull ghcr.io/yunyang906/grok-rs:latest
 
 首页和账号池还会分别显示每个 Grok OAuth 订阅账号的真实额度，包括订阅档位、已用/剩余百分比、额度周期、重置时间和额外用量状态。数据由服务端使用账号凭据请求 Grok CLI Billing 接口，成功结果缓存 5 分钟；access token 和 refresh token 始终不会返回浏览器。
 
+“调度设置”页面可以热更新账号选择策略、会话粘滞时长和失败重试次数，并为每个 OAuth 账号设置 `-100` 至 `100` 的优先级。优先级数值越高越先使用；同一最高优先级内再使用 `round-robin`（均衡轮询）或 `fill-first`（优先用满）策略。账号不可用或进入冷却时会自动故障切换。
+
 > 本地 HTTP 测试需要设置 `COOKIE_SECURE=false`；Zeabur 等公网 HTTPS 部署保持默认的 `true`。
 
 Claude Code 配置：
