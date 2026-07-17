@@ -1,10 +1,13 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -46,6 +49,9 @@ struct AppState {
     issued_keys_path: PathBuf,
     usage: Arc<Mutex<Vec<KeyUsage>>>,
     usage_path: PathBuf,
+    traffic_policy: Arc<Mutex<TrafficPolicy>>,
+    traffic_policy_path: PathBuf,
+    traffic_runtime: Arc<TrafficRuntime>,
     auth_dir: PathBuf,
     account_quota_cache: Arc<Mutex<HashMap<String, CachedAccountQuota>>>,
     admin_password_hash: [u8; 32],
@@ -100,6 +106,43 @@ struct RoutingSettings {
     session_affinity: bool,
     session_affinity_ttl: String,
     request_retry: u8,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrafficPolicy {
+    enabled: bool,
+    max_concurrent_requests: u32,
+    requests_per_minute_per_key: u32,
+}
+
+impl Default for TrafficPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_concurrent_requests: 8,
+            requests_per_minute_per_key: 60,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TrafficRuntime {
+    active: Arc<AtomicU32>,
+    recent_by_key: Mutex<HashMap<u64, VecDeque<Instant>>>,
+}
+
+struct TrafficLease {
+    active: Arc<AtomicU32>,
+    counted: bool,
+}
+
+impl Drop for TrafficLease {
+    fn drop(&mut self) {
+        if self.counted {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -203,8 +246,12 @@ async fn main() -> Result<()> {
     let usage_path = PathBuf::from(
         env::var("API_KEY_USAGE_FILE").unwrap_or_else(|_| "/data/api_key_usage.json".to_string()),
     );
+    let traffic_policy_path = PathBuf::from(
+        env::var("TRAFFIC_POLICY_FILE").unwrap_or_else(|_| "/data/traffic_policy.json".to_string()),
+    );
     let issued_keys = load_issued_keys(&issued_keys_path).await?;
     let usage = load_usage(&usage_path).await?;
+    let traffic_policy = load_traffic_policy(&traffic_policy_path).await?;
     let auth_dir =
         PathBuf::from(env::var("GROK_AUTH_DIR").unwrap_or_else(|_| "/data/auth".to_string()));
     let child = start_engine_if_configured(&management_key, &public_api_key).await?;
@@ -219,6 +266,9 @@ async fn main() -> Result<()> {
         issued_keys_path,
         usage: Arc::new(Mutex::new(usage)),
         usage_path,
+        traffic_policy: Arc::new(Mutex::new(traffic_policy)),
+        traffic_policy_path,
+        traffic_runtime: Arc::new(TrafficRuntime::default()),
         auth_dir,
         account_quota_cache: Arc::new(Mutex::new(HashMap::new())),
         admin_password_hash: Sha256::digest(admin_password.as_bytes()).into(),
@@ -250,6 +300,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/admin/settings/routing",
             get(get_routing_settings).patch(update_routing_settings),
+        )
+        .route(
+            "/api/admin/settings/traffic",
+            get(get_traffic_policy).patch(update_traffic_policy),
         )
         .route("/api/admin/login", post(start_login))
         .route("/api/admin/login/status", get(login_status))
@@ -394,6 +448,27 @@ async fn save_usage(path: &Path, usage: &[KeyUsage]) -> Result<()> {
     }
     let temporary = path.with_extension("json.tmp");
     tokio::fs::write(&temporary, serde_json::to_vec_pretty(usage)?).await?;
+    tokio::fs::rename(temporary, path).await?;
+    Ok(())
+}
+
+async fn load_traffic_policy(path: &Path) -> Result<TrafficPolicy> {
+    if !path.exists() {
+        return Ok(TrafficPolicy::default());
+    }
+    let content = tokio::fs::read_to_string(path).await?;
+    if content.trim().is_empty() {
+        return Ok(TrafficPolicy::default());
+    }
+    serde_json::from_str(&content).context("invalid traffic policy file")
+}
+
+async fn save_traffic_policy(path: &Path, policy: &TrafficPolicy) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    tokio::fs::write(&temporary, serde_json::to_vec_pretty(policy)?).await?;
     tokio::fs::rename(temporary, path).await?;
     Ok(())
 }
@@ -821,6 +896,52 @@ fn apply_routing_settings_to_yaml(input: &str, settings: &RoutingSettings) -> St
         settings.session_affinity_ttl
     ));
     output
+}
+
+async fn get_traffic_policy(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    axum::Json(state.traffic_policy.lock().await.clone()).into_response()
+}
+
+async fn update_traffic_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(payload): axum::Json<TrafficPolicy>,
+) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    if let Err(message) = validate_traffic_policy(&payload) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": message})),
+        )
+            .into_response();
+    }
+    let mut policy = state.traffic_policy.lock().await;
+    let previous = policy.clone();
+    *policy = payload.clone();
+    if let Err(error) = save_traffic_policy(&state.traffic_policy_path, &policy).await {
+        *policy = previous;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+    axum::Json(payload).into_response()
+}
+
+fn validate_traffic_policy(policy: &TrafficPolicy) -> std::result::Result<(), &'static str> {
+    if !(1..=100).contains(&policy.max_concurrent_requests) {
+        return Err("全局并发必须在 1 到 100 之间");
+    }
+    if !(1..=10_000).contains(&policy.requests_per_minute_per_key) {
+        return Err("每个 Key 的 RPM 必须在 1 到 10000 之间");
+    }
+    Ok(())
 }
 
 async fn list_account_quotas(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1296,6 +1417,70 @@ fn api_auth_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+fn traffic_limit_error(message: &str) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        axum::Json(json!({
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": message}
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
+}
+
+async fn acquire_traffic_lease(
+    state: &AppState,
+    key_id: u64,
+) -> std::result::Result<TrafficLease, Response> {
+    let policy = state.traffic_policy.lock().await.clone();
+    if !policy.enabled {
+        return Ok(TrafficLease {
+            active: state.traffic_runtime.active.clone(),
+            counted: false,
+        });
+    }
+
+    loop {
+        let active = state.traffic_runtime.active.load(Ordering::Acquire);
+        if active >= policy.max_concurrent_requests {
+            return Err(traffic_limit_error("服务并发已达到安全上限，请稍后重试"));
+        }
+        if state
+            .traffic_runtime
+            .active
+            .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    let lease = TrafficLease {
+        active: state.traffic_runtime.active.clone(),
+        counted: true,
+    };
+
+    let now = Instant::now();
+    let mut recent_by_key = state.traffic_runtime.recent_by_key.lock().await;
+    let recent = recent_by_key.entry(key_id).or_default();
+    recent.retain(|timestamp| now.duration_since(*timestamp) < Duration::from_secs(60));
+    if recent.len() >= policy.requests_per_minute_per_key as usize {
+        return Err(traffic_limit_error("当前 API Key 请求过于频繁，请稍后重试"));
+    }
+    recent.push_back(now);
+    if recent_by_key.len() > 4096 {
+        for requests in recent_by_key.values_mut() {
+            requests.retain(|timestamp| now.duration_since(*timestamp) < Duration::from_secs(60));
+        }
+        recent_by_key.retain(|_, requests| !requests.is_empty());
+    }
+    drop(recent_by_key);
+    Ok(lease)
+}
+
 async fn proxy_v1(State(state): State<AppState>, request: Request) -> Response {
     proxy_request(state, request).await
 }
@@ -1309,6 +1494,10 @@ async fn proxy_request(state: AppState, request: Request) -> Response {
     let identity = match authorize_api_request(&state, &parts.headers).await {
         Ok(identity) => identity,
         Err((status, message)) => return api_auth_error(status, message),
+    };
+    let traffic_lease = match acquire_traffic_lease(&state, identity.key_id).await {
+        Ok(lease) => lease,
+        Err(response) => return response,
     };
     let suffix = parts
         .uri
@@ -1340,7 +1529,7 @@ async fn proxy_request(state: AppState, request: Request) -> Response {
         .header("x-api-key", &state.public_api_key)
         .bearer_auth(&state.public_api_key);
     match upstream.send().await {
-        Ok(response) => relay_response_with_usage(response, state, identity, model),
+        Ok(response) => relay_response_with_usage(response, state, identity, model, traffic_lease),
         Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
     }
 }
@@ -1446,11 +1635,13 @@ fn relay_response_with_usage(
     state: AppState,
     identity: ApiIdentity,
     model: String,
+    traffic_lease: TrafficLease,
 ) -> Response {
     const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let observed = async_stream::stream! {
+        let _traffic_lease = traffic_lease;
         let mut stream = upstream.bytes_stream();
         let mut captured = Vec::new();
         while let Some(result) = stream.next().await {
@@ -1522,9 +1713,9 @@ async fn shutdown_signal(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountQuota, RoutingSettings, UsageDelta, apply_billing_value,
+        AccountQuota, RoutingSettings, TrafficPolicy, UsageDelta, apply_billing_value,
         apply_routing_settings_to_yaml, extract_usage_delta, remove_top_level_yaml_section,
-        routing_settings_from_config,
+        routing_settings_from_config, validate_traffic_policy,
     };
     use serde_json::json;
 
@@ -1668,5 +1859,26 @@ mod tests {
         assert!(configured.session_affinity);
         assert_eq!(configured.session_affinity_ttl, "6h");
         assert_eq!(configured.request_retry, 4);
+    }
+
+    #[test]
+    fn validates_safe_traffic_policy_ranges() {
+        assert!(validate_traffic_policy(&TrafficPolicy::default()).is_ok());
+        assert!(
+            validate_traffic_policy(&TrafficPolicy {
+                enabled: true,
+                max_concurrent_requests: 0,
+                requests_per_minute_per_key: 60,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_traffic_policy(&TrafficPolicy {
+                enabled: true,
+                max_concurrent_requests: 8,
+                requests_per_minute_per_key: 10_001,
+            })
+            .is_err()
+        );
     }
 }

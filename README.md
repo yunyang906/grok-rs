@@ -27,6 +27,8 @@ docker pull ghcr.io/yunyang906/grok-rs:latest
 
 “调度设置”页面可以热更新账号选择策略、会话粘滞时长和失败重试次数，并为每个 OAuth 账号设置 `-100` 至 `100` 的优先级。优先级数值越高越先使用；同一最高优先级内再使用 `round-robin`（均衡轮询）或 `fill-first`（优先用满）策略。账号不可用或进入冷却时会自动故障切换。
 
+同一页面提供流量风险控制：可设置全局并发上限和每个用户 Key 的每分钟请求上限，超过阈值时返回标准 429 响应并保留 `Retry-After`。默认开启，限制为 8 个并发请求和每 Key 每分钟 60 次请求，配置持久化到 `/data/traffic_policy.json`。这些措施用于抑制突发和异常调用，不能保证第三方订阅账号不会受到平台限制。
+
 > 本地 HTTP 测试需要设置 `COOKIE_SECURE=false`；Zeabur 等公网 HTTPS 部署保持默认的 `true`。
 
 Claude Code 配置：
