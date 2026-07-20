@@ -1590,7 +1590,24 @@ fn inject_prompt_cache_key(body: &[u8], headers: &HeaderMap, key_id: u64) -> Vec
     let digest = Sha256::digest(format!("{key_id}\0{stable_source}").as_bytes());
     value["prompt_cache_key"] =
         Value::String(format!("cc_{}", URL_SAFE_NO_PAD.encode(&digest[..18])));
+    force_high_grok_reasoning(&mut value);
     serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
+fn force_high_grok_reasoning(value: &mut Value) {
+    let is_grok_45 = value
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| model == "grok-4.5" || model.starts_with("grok-4.5-"));
+    if !is_grok_45 {
+        return;
+    }
+
+    value["thinking"] = json!({"type": "adaptive"});
+    if !value.get("output_config").is_some_and(Value::is_object) {
+        value["output_config"] = json!({});
+    }
+    value["output_config"]["effort"] = Value::String("high".to_string());
 }
 
 fn usage_number(usage: &Value, primary: &str, compatible: &str) -> u64 {
@@ -1857,6 +1874,17 @@ mod tests {
 
         assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
         assert_ne!(first["prompt_cache_key"], other_user["prompt_cache_key"]);
+    }
+
+    #[test]
+    fn forces_grok_45_to_high_reasoning() {
+        let headers = HeaderMap::new();
+        let body = br#"{"model":"grok-4.5","thinking":{"type":"adaptive"},"output_config":{"effort":"low"},"messages":[{"role":"user","content":"hello"}]}"#;
+        let prepared: serde_json::Value =
+            serde_json::from_slice(&inject_prompt_cache_key(body, &headers, 7)).unwrap();
+
+        assert_eq!(prepared["thinking"]["type"], "adaptive");
+        assert_eq!(prepared["output_config"]["effort"], "high");
     }
 
     #[test]
