@@ -137,6 +137,27 @@ struct TrafficLease {
     counted: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RealtimeTrafficMetrics {
+    window_seconds: u64,
+    rpm: u32,
+    active_requests: u32,
+    protection_enabled: bool,
+    rpm_limit_per_key: u32,
+    users: Vec<UserRpm>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserRpm {
+    api_key_id: u64,
+    api_key_name: String,
+    rpm: u32,
+    rpm_limit: Option<u32>,
+    utilization_percent: Option<f64>,
+}
+
 impl Drop for TrafficLease {
     fn drop(&mut self) {
         if self.counted {
@@ -316,6 +337,7 @@ async fn main() -> Result<()> {
             patch(update_issued_key).delete(delete_issued_key),
         )
         .route("/api/admin/usage", get(list_usage))
+        .route("/api/admin/realtime", get(realtime_traffic_metrics))
         .route("/api/admin/usage/{id}", delete(reset_usage))
         .route("/v1/{*path}", any(proxy_v1))
         .route("/cc/{*path}", any(proxy_cc))
@@ -1326,6 +1348,71 @@ async fn list_usage(State(state): State<AppState>, headers: HeaderMap) -> Respon
     axum::Json(state.usage.lock().await.clone()).into_response()
 }
 
+async fn realtime_traffic_metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+
+    let policy = state.traffic_policy.lock().await.clone();
+    let issued_keys = state.issued_keys.lock().await.clone();
+    let now = Instant::now();
+    let mut recent_by_key = state.traffic_runtime.recent_by_key.lock().await;
+    for requests in recent_by_key.values_mut() {
+        requests.retain(|timestamp| now.duration_since(*timestamp) < Duration::from_secs(60));
+    }
+    recent_by_key.retain(|_, requests| !requests.is_empty());
+
+    let mut names = HashMap::from([(0_u64, "主 API Key".to_string())]);
+    for key in issued_keys {
+        names.insert(key.id, key.name);
+    }
+    for key_id in recent_by_key.keys() {
+        names
+            .entry(*key_id)
+            .or_insert_with(|| format!("已删除 Key #{key_id:03}"));
+    }
+
+    let rpm_limit = policy.enabled.then_some(policy.requests_per_minute_per_key);
+    let mut users = names
+        .into_iter()
+        .map(|(api_key_id, api_key_name)| {
+            let rpm = recent_by_key
+                .get(&api_key_id)
+                .map_or(0, |requests| requests.len() as u32);
+            UserRpm {
+                api_key_id,
+                api_key_name,
+                rpm,
+                rpm_limit,
+                utilization_percent: rpm_limit.map(|limit| {
+                    if limit == 0 {
+                        0.0
+                    } else {
+                        rpm as f64 / limit as f64 * 100.0
+                    }
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    users.sort_by(|left, right| {
+        right
+            .rpm
+            .cmp(&left.rpm)
+            .then_with(|| left.api_key_id.cmp(&right.api_key_id))
+    });
+    let rpm = users.iter().map(|user| user.rpm).sum();
+
+    axum::Json(RealtimeTrafficMetrics {
+        window_seconds: 60,
+        rpm,
+        active_requests: state.traffic_runtime.active.load(Ordering::Acquire),
+        protection_enabled: policy.enabled,
+        rpm_limit_per_key: policy.requests_per_minute_per_key,
+        users,
+    })
+    .into_response()
+}
+
 async fn reset_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1437,26 +1524,23 @@ async fn acquire_traffic_lease(
     key_id: u64,
 ) -> std::result::Result<TrafficLease, Response> {
     let policy = state.traffic_policy.lock().await.clone();
-    if !policy.enabled {
-        return Ok(TrafficLease {
-            active: state.traffic_runtime.active.clone(),
-            counted: false,
-        });
-    }
-
-    loop {
-        let active = state.traffic_runtime.active.load(Ordering::Acquire);
-        if active >= policy.max_concurrent_requests {
-            return Err(traffic_limit_error("服务并发已达到安全上限，请稍后重试"));
+    if policy.enabled {
+        loop {
+            let active = state.traffic_runtime.active.load(Ordering::Acquire);
+            if active >= policy.max_concurrent_requests {
+                return Err(traffic_limit_error("服务并发已达到安全上限，请稍后重试"));
+            }
+            if state
+                .traffic_runtime
+                .active
+                .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
         }
-        if state
-            .traffic_runtime
-            .active
-            .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            break;
-        }
+    } else {
+        state.traffic_runtime.active.fetch_add(1, Ordering::AcqRel);
     }
     let lease = TrafficLease {
         active: state.traffic_runtime.active.clone(),
@@ -1467,7 +1551,7 @@ async fn acquire_traffic_lease(
     let mut recent_by_key = state.traffic_runtime.recent_by_key.lock().await;
     let recent = recent_by_key.entry(key_id).or_default();
     recent.retain(|timestamp| now.duration_since(*timestamp) < Duration::from_secs(60));
-    if recent.len() >= policy.requests_per_minute_per_key as usize {
+    if policy.enabled && recent.len() >= policy.requests_per_minute_per_key as usize {
         return Err(traffic_limit_error("当前 API Key 请求过于频繁，请稍后重试"));
     }
     recent.push_back(now);
