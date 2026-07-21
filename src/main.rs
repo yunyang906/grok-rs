@@ -263,6 +263,10 @@ struct RequestEvent {
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
+    #[serde(default)]
+    cache_creation_tokens: u64,
+    #[serde(default)]
+    cache_read_tokens: u64,
     session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -2289,6 +2293,8 @@ async fn record_request_event(
         input_tokens: delta.input_tokens,
         output_tokens: delta.output_tokens,
         cached_tokens: delta.cache_creation_input_tokens + delta.cache_read_input_tokens,
+        cache_creation_tokens: delta.cache_creation_input_tokens,
+        cache_read_tokens: delta.cache_read_input_tokens,
         session_id: session_id.to_string(),
         error,
     };
