@@ -6,7 +6,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -49,6 +49,15 @@ struct AppState {
     issued_keys_path: PathBuf,
     usage: Arc<Mutex<Vec<KeyUsage>>>,
     usage_path: PathBuf,
+    request_events: Arc<Mutex<Vec<RequestEvent>>>,
+    request_events_path: PathBuf,
+    request_event_limit: usize,
+    next_request_event_id: Arc<AtomicU64>,
+    request_events_dirty: Arc<AtomicU32>,
+    request_events_flush_lock: Arc<Mutex<()>>,
+    notification_settings: Arc<Mutex<NotificationSettings>>,
+    notification_settings_path: PathBuf,
+    last_notification_at: Arc<Mutex<Option<Instant>>>,
     traffic_policy: Arc<Mutex<TrafficPolicy>>,
     traffic_policy_path: PathBuf,
     traffic_runtime: Arc<TrafficRuntime>,
@@ -59,6 +68,7 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<String, Instant>>>,
     login_failures: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
     child: Arc<Mutex<Option<Child>>>,
+    started_at: Instant,
 }
 
 #[derive(Clone)]
@@ -201,6 +211,14 @@ struct ApiIdentity {
     key_name: String,
 }
 
+struct RequestObservation {
+    id: u64,
+    started: Instant,
+    identity: ApiIdentity,
+    model: String,
+    session_id: String,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KeyUsage {
@@ -224,12 +242,66 @@ struct ModelUsage {
     output_tokens: u64,
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 struct UsageDelta {
     input_tokens: u64,
     output_tokens: u64,
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestEvent {
+    id: u64,
+    timestamp: u64,
+    duration_ms: u64,
+    api_key_id: u64,
+    api_key_name: String,
+    model: String,
+    status: u16,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationSettings {
+    enabled: bool,
+    webhook_url: String,
+    error_rate_threshold: u32,
+    quota_remaining_threshold: u32,
+    notify_on_auth_failure: bool,
+    notify_on_rate_limit: bool,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            webhook_url: String::new(),
+            error_rate_threshold: 10,
+            quota_remaining_threshold: 20,
+            notify_on_auth_failure: true,
+            notify_on_rate_limit: true,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupBundle {
+    version: u32,
+    exported_at: u64,
+    issued_keys: Vec<IssuedApiKey>,
+    usage: Vec<KeyUsage>,
+    traffic_policy: TrafficPolicy,
+    notification_settings: NotificationSettings,
+    request_events: Vec<RequestEvent>,
 }
 
 #[derive(Deserialize)]
@@ -270,9 +342,35 @@ async fn main() -> Result<()> {
     let traffic_policy_path = PathBuf::from(
         env::var("TRAFFIC_POLICY_FILE").unwrap_or_else(|_| "/data/traffic_policy.json".to_string()),
     );
+    let request_events_path = PathBuf::from(
+        env::var("REQUEST_EVENTS_FILE").unwrap_or_else(|_| "/data/request_events.json".to_string()),
+    );
+    let notification_settings_path = PathBuf::from(
+        env::var("NOTIFICATION_SETTINGS_FILE")
+            .unwrap_or_else(|_| "/data/notification_settings.json".to_string()),
+    );
+    let request_event_limit = env::var("REQUEST_EVENT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5_000)
+        .clamp(100, 100_000);
     let issued_keys = load_issued_keys(&issued_keys_path).await?;
     let usage = load_usage(&usage_path).await?;
     let traffic_policy = load_traffic_policy(&traffic_policy_path).await?;
+    let mut request_events =
+        load_json_or_default::<Vec<RequestEvent>>(&request_events_path).await?;
+    if request_events.len() > request_event_limit {
+        let excess = request_events.len() - request_event_limit;
+        request_events.drain(..excess);
+    }
+    let next_request_event_id = request_events
+        .iter()
+        .map(|event| event.id)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let notification_settings =
+        load_json_or_default::<NotificationSettings>(&notification_settings_path).await?;
     let auth_dir =
         PathBuf::from(env::var("GROK_AUTH_DIR").unwrap_or_else(|_| "/data/auth".to_string()));
     let child = start_engine_if_configured(&management_key, &public_api_key).await?;
@@ -287,6 +385,15 @@ async fn main() -> Result<()> {
         issued_keys_path,
         usage: Arc::new(Mutex::new(usage)),
         usage_path,
+        request_events: Arc::new(Mutex::new(request_events)),
+        request_events_path,
+        request_event_limit,
+        next_request_event_id: Arc::new(AtomicU64::new(next_request_event_id)),
+        request_events_dirty: Arc::new(AtomicU32::new(0)),
+        request_events_flush_lock: Arc::new(Mutex::new(())),
+        notification_settings: Arc::new(Mutex::new(notification_settings)),
+        notification_settings_path,
+        last_notification_at: Arc::new(Mutex::new(None)),
         traffic_policy: Arc::new(Mutex::new(traffic_policy)),
         traffic_policy_path,
         traffic_runtime: Arc::new(TrafficRuntime::default()),
@@ -297,9 +404,11 @@ async fn main() -> Result<()> {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         login_failures: Arc::new(Mutex::new(HashMap::new())),
         child: Arc::new(Mutex::new(child)),
+        started_at: Instant::now(),
     };
 
     wait_for_engine(&state).await?;
+    tokio::spawn(request_event_flush_loop(state.clone()));
 
     let app = Router::new()
         .route("/", get(index))
@@ -338,6 +447,16 @@ async fn main() -> Result<()> {
         )
         .route("/api/admin/usage", get(list_usage))
         .route("/api/admin/realtime", get(realtime_traffic_metrics))
+        .route(
+            "/api/admin/request-events",
+            get(list_request_events).delete(clear_request_events),
+        )
+        .route(
+            "/api/admin/settings/notifications",
+            get(get_notification_settings).patch(update_notification_settings),
+        )
+        .route("/api/admin/backup", get(export_backup).post(restore_backup))
+        .route("/api/admin/system-info", get(system_info))
         .route("/api/admin/usage/{id}", delete(reset_usage))
         .route("/v1/{*path}", any(proxy_v1))
         .route("/cc/{*path}", any(proxy_cc))
@@ -472,6 +591,55 @@ async fn save_usage(path: &Path, usage: &[KeyUsage]) -> Result<()> {
     tokio::fs::write(&temporary, serde_json::to_vec_pretty(usage)?).await?;
     tokio::fs::rename(temporary, path).await?;
     Ok(())
+}
+
+async fn load_json_or_default<T>(path: &Path) -> Result<T>
+where
+    T: for<'de> Deserialize<'de> + Default,
+{
+    if !path.exists() {
+        return Ok(T::default());
+    }
+    let content = tokio::fs::read_to_string(path).await?;
+    if content.trim().is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_str(&content).with_context(|| format!("invalid JSON file: {}", path.display()))
+}
+
+async fn save_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    tokio::fs::write(&temporary, serde_json::to_vec_pretty(value)?).await?;
+    tokio::fs::rename(temporary, path).await?;
+    Ok(())
+}
+
+async fn flush_request_events(state: &AppState) -> Result<()> {
+    if state.request_events_dirty.swap(0, Ordering::AcqRel) == 0 {
+        return Ok(());
+    }
+    let _flush_guard = state.request_events_flush_lock.lock().await;
+    let snapshot = state.request_events.lock().await.clone();
+    if let Err(error) = save_json(&state.request_events_path, &snapshot).await {
+        state.request_events_dirty.fetch_add(1, Ordering::AcqRel);
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn request_event_flush_loop(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if let Err(error) = flush_request_events(&state).await {
+            tracing::warn!(%error, "failed to flush request event batch");
+        }
+    }
 }
 
 async fn load_traffic_policy(path: &Path) -> Result<TrafficPolicy> {
@@ -1043,7 +1211,45 @@ async fn list_account_quotas(State(state): State<AppState>, headers: HeaderMap) 
         quotas.push(quota);
     }
     quotas.sort_by(|a, b| a.email.cmp(&b.email).then_with(|| a.name.cmp(&b.name)));
+    maybe_send_quota_notification(&state, &quotas).await;
     axum::Json(quotas).into_response()
+}
+
+async fn maybe_send_quota_notification(state: &AppState, quotas: &[AccountQuota]) {
+    let settings = state.notification_settings.lock().await.clone();
+    if !settings.enabled || settings.webhook_url.is_empty() {
+        return;
+    }
+    let Some(quota) = quotas.iter().find(|quota| {
+        quota
+            .remaining_percent
+            .is_some_and(|remaining| remaining <= settings.quota_remaining_threshold as f64)
+    }) else {
+        return;
+    };
+    let now = Instant::now();
+    let mut last = state.last_notification_at.lock().await;
+    if last.is_some_and(|previous| now.duration_since(previous) < Duration::from_secs(300)) {
+        return;
+    }
+    *last = Some(now);
+    drop(last);
+    let payload = json!({
+        "source": "grok-rs",
+        "event": "quota_low",
+        "account": quota.email,
+        "remainingPercent": quota.remaining_percent,
+        "threshold": settings.quota_remaining_threshold
+    });
+    if let Err(error) = state
+        .client
+        .post(&settings.webhook_url)
+        .json(&payload)
+        .send()
+        .await
+    {
+        tracing::warn!(%error, "failed to deliver quota webhook");
+    }
 }
 
 async fn fetch_account_quota(
@@ -1413,6 +1619,221 @@ async fn realtime_traffic_metrics(State(state): State<AppState>, headers: Header
     .into_response()
 }
 
+async fn list_request_events(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    let events = state.request_events.lock().await;
+    let start = events.len().saturating_sub(2_000);
+    axum::Json(events[start..].to_vec()).into_response()
+}
+
+async fn clear_request_events(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    let _flush_guard = state.request_events_flush_lock.lock().await;
+    let mut events = state.request_events.lock().await;
+    events.clear();
+    if let Err(error) = save_json(&state.request_events_path, &*events).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+    state.request_events_dirty.store(0, Ordering::Release);
+    axum::Json(json!({"ok": true})).into_response()
+}
+
+async fn get_notification_settings(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    axum::Json(state.notification_settings.lock().await.clone()).into_response()
+}
+
+async fn update_notification_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(settings): axum::Json<NotificationSettings>,
+) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    if settings.error_rate_threshold > 100 || settings.quota_remaining_threshold > 100 {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "通知阈值必须在 0–100 之间"})),
+        )
+            .into_response();
+    }
+    if !settings.webhook_url.is_empty() && !settings.webhook_url.starts_with("https://") {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "公网部署仅允许 HTTPS Webhook 地址"})),
+        )
+            .into_response();
+    }
+    let mut current = state.notification_settings.lock().await;
+    if let Err(error) = save_json(&state.notification_settings_path, &settings).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+    *current = settings.clone();
+    axum::Json(settings).into_response()
+}
+
+async fn export_backup(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    let bundle = BackupBundle {
+        version: 1,
+        exported_at: unix_seconds(),
+        issued_keys: state.issued_keys.lock().await.clone(),
+        usage: state.usage.lock().await.clone(),
+        traffic_policy: state.traffic_policy.lock().await.clone(),
+        notification_settings: state.notification_settings.lock().await.clone(),
+        request_events: state.request_events.lock().await.clone(),
+    };
+    let mut response = axum::Json(bundle).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"grok-rs-backup.json\""),
+    );
+    response
+}
+
+async fn restore_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(bundle): axum::Json<BackupBundle>,
+) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    if bundle.version != 1 || bundle.request_events.len() > state.request_event_limit {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "备份版本无效或请求记录超过当前存储上限"})),
+        )
+            .into_response();
+    }
+    if let Err(message) = validate_traffic_policy(&bundle.traffic_policy) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": message})),
+        )
+            .into_response();
+    }
+    if let Err(error) = save_issued_keys(&state.issued_keys_path, &bundle.issued_keys).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+    if let Err(error) = save_usage(&state.usage_path, &bundle.usage).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+    if let Err(error) = save_json(&state.traffic_policy_path, &bundle.traffic_policy).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+    if let Err(error) = save_json(
+        &state.notification_settings_path,
+        &bundle.notification_settings,
+    )
+    .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+    let next_event_id = bundle
+        .request_events
+        .iter()
+        .map(|event| event.id)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    {
+        let _flush_guard = state.request_events_flush_lock.lock().await;
+        let mut current_events = state.request_events.lock().await;
+        *current_events = bundle.request_events.clone();
+        if let Err(error) = save_json(&state.request_events_path, &*current_events).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+        state.request_events_dirty.store(0, Ordering::Release);
+    }
+    *state.issued_keys.lock().await = bundle.issued_keys;
+    *state.usage.lock().await = bundle.usage;
+    *state.traffic_policy.lock().await = bundle.traffic_policy;
+    *state.notification_settings.lock().await = bundle.notification_settings;
+    state
+        .next_request_event_id
+        .store(next_event_id, Ordering::Release);
+    axum::Json(json!({"ok": true})).into_response()
+}
+
+async fn system_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize_admin(&headers, &state).await.is_err() {
+        return unauthorized();
+    }
+    let engine_reachable = state
+        .client
+        .get(format!("{}/", state.engine_url))
+        .send()
+        .await
+        .is_ok();
+    let mut account_files = 0_u64;
+    if let Ok(mut entries) = tokio::fs::read_dir(&state.auth_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "json")
+            {
+                account_files += 1;
+            }
+        }
+    }
+    axum::Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptimeSeconds": state.started_at.elapsed().as_secs(),
+        "engineReachable": engine_reachable,
+        "engineManaged": state.child.lock().await.is_some(),
+        "activeRequests": state.traffic_runtime.active.load(Ordering::Acquire),
+        "issuedKeys": state.issued_keys.lock().await.len(),
+        "requestEvents": state.request_events.lock().await.len(),
+        "requestEventLimit": state.request_event_limit,
+        "accountFiles": account_files,
+        "dataPaths": {
+            "usage": state.usage_path.display().to_string(),
+            "events": state.request_events_path.display().to_string(),
+            "auth": state.auth_dir.display().to_string()
+        }
+    }))
+    .into_response()
+}
+
 async fn reset_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1583,6 +2004,8 @@ async fn proxy_request(state: AppState, request: Request) -> Response {
         Ok(lease) => lease,
         Err(response) => return response,
     };
+    let request_started = Instant::now();
+    let request_event_id = state.next_request_event_id.fetch_add(1, Ordering::AcqRel);
     let suffix = parts
         .uri
         .path_and_query()
@@ -1596,10 +2019,22 @@ async fn proxy_request(state: AppState, request: Request) -> Response {
         }
     };
     let body = inject_prompt_cache_key(&bytes, &parts.headers, identity.key_id);
-    let model = serde_json::from_slice::<Value>(&body)
-        .ok()
+    let parsed_body = serde_json::from_slice::<Value>(&body).ok();
+    let model = parsed_body
+        .as_ref()
         .and_then(|value| value.get("model")?.as_str().map(str::to_string))
         .unwrap_or_else(|| "unknown".to_string());
+    let session_id = parsed_body
+        .as_ref()
+        .and_then(|value| value.get("prompt_cache_key")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("key-{}", identity.key_id));
+    let observation = RequestObservation {
+        id: request_event_id,
+        started: request_started,
+        identity,
+        model,
+        session_id,
+    };
     let mut upstream = state.client.request(parts.method, target).body(body);
     for (name, value) in &parts.headers {
         if name.as_str().eq_ignore_ascii_case("host")
@@ -1615,8 +2050,26 @@ async fn proxy_request(state: AppState, request: Request) -> Response {
         .header("x-api-key", &state.public_api_key)
         .bearer_auth(&state.public_api_key);
     match upstream.send().await {
-        Ok(response) => relay_response_with_usage(response, state, identity, model, traffic_lease),
-        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+        Ok(response) => relay_response_with_usage(response, state, observation, traffic_lease),
+        Err(error) => {
+            let message = error.to_string();
+            if let Err(record_error) = record_request_event(
+                &state,
+                observation.id,
+                &observation.identity,
+                &observation.model,
+                &observation.session_id,
+                StatusCode::BAD_GATEWAY.as_u16(),
+                observation.started,
+                UsageDelta::default(),
+                Some(message.clone()),
+            )
+            .await
+            {
+                tracing::error!(%record_error, "failed to persist failed request event");
+            }
+            (StatusCode::BAD_GATEWAY, message).into_response()
+        }
     }
 }
 
@@ -1800,11 +2253,110 @@ async fn record_usage(
     save_usage(&state.usage_path, &usage).await
 }
 
+fn extract_error_message(body: &[u8]) -> Option<String> {
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        for pointer in ["/error/message", "/message", "/error"] {
+            if let Some(message) = value.pointer(pointer).and_then(Value::as_str) {
+                return Some(message.chars().take(500).collect());
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(body).trim().to_string();
+    (!text.is_empty()).then(|| text.chars().take(500).collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_request_event(
+    state: &AppState,
+    id: u64,
+    identity: &ApiIdentity,
+    model: &str,
+    session_id: &str,
+    status: u16,
+    started: Instant,
+    delta: UsageDelta,
+    error: Option<String>,
+) -> Result<()> {
+    let mut events = state.request_events.lock().await;
+    let event = RequestEvent {
+        id,
+        timestamp: unix_seconds(),
+        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        api_key_id: identity.key_id,
+        api_key_name: identity.key_name.clone(),
+        model: model.to_string(),
+        status,
+        input_tokens: delta.input_tokens,
+        output_tokens: delta.output_tokens,
+        cached_tokens: delta.cache_creation_input_tokens + delta.cache_read_input_tokens,
+        session_id: session_id.to_string(),
+        error,
+    };
+    events.push(event.clone());
+    if events.len() > state.request_event_limit {
+        let excess = events.len() - state.request_event_limit;
+        events.drain(..excess);
+    }
+    let cutoff = unix_seconds().saturating_sub(3600);
+    let recent = events
+        .iter()
+        .filter(|entry| entry.timestamp >= cutoff)
+        .collect::<Vec<_>>();
+    let recent_error_rate = if recent.is_empty() {
+        0.0
+    } else {
+        recent.iter().filter(|entry| entry.status >= 400).count() as f64 / recent.len() as f64
+            * 100.0
+    };
+    drop(events);
+    state.request_events_dirty.fetch_add(1, Ordering::Relaxed);
+    maybe_send_notification(state, &event, recent_error_rate).await;
+    Ok(())
+}
+
+async fn maybe_send_notification(state: &AppState, event: &RequestEvent, error_rate: f64) {
+    let settings = state.notification_settings.lock().await.clone();
+    if !settings.enabled || settings.webhook_url.is_empty() || event.status < 400 {
+        return;
+    }
+    let should_notify = (settings.notify_on_auth_failure
+        && (event.status == 401 || event.status == 403))
+        || (settings.notify_on_rate_limit && event.status == 429)
+        || error_rate >= settings.error_rate_threshold as f64;
+    if !should_notify {
+        return;
+    }
+    let now = Instant::now();
+    let mut last = state.last_notification_at.lock().await;
+    if last.is_some_and(|previous| now.duration_since(previous) < Duration::from_secs(300)) {
+        return;
+    }
+    *last = Some(now);
+    drop(last);
+    let payload = json!({
+        "source": "grok-rs",
+        "event": "request_error",
+        "status": event.status,
+        "user": event.api_key_name,
+        "model": event.model,
+        "errorRateLastHour": error_rate,
+        "message": event.error
+    });
+    if let Err(error) = state
+        .client
+        .post(&settings.webhook_url)
+        .json(&payload)
+        .send()
+        .await
+    {
+        tracing::warn!(%error, "failed to deliver notification webhook");
+    }
+}
+
 fn relay_response_with_usage(
     upstream: reqwest::Response,
     state: AppState,
-    identity: ApiIdentity,
-    model: String,
+    observation: RequestObservation,
     traffic_lease: TrafficLease,
 ) -> Response {
     const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
@@ -1823,11 +2375,23 @@ fn relay_response_with_usage(
             }
             yield result;
         }
-        if status.is_success()
-            && let Some(delta) = extract_usage_delta(&captured)
-            && let Err(error) = record_usage(&state, &identity, &model, delta).await
-        {
-            tracing::error!(%error, key_id = identity.key_id, "failed to persist API key usage");
+        let delta = extract_usage_delta(&captured).unwrap_or_default();
+        if status.is_success() && let Err(error) = record_usage(&state, &observation.identity, &observation.model, delta).await {
+            tracing::error!(%error, key_id = observation.identity.key_id, "failed to persist API key usage");
+        }
+        let error_message = (!status.is_success()).then(|| extract_error_message(&captured)).flatten();
+        if let Err(error) = record_request_event(
+            &state,
+            observation.id,
+            &observation.identity,
+            &observation.model,
+            &observation.session_id,
+            status.as_u16(),
+            observation.started,
+            delta,
+            error_message,
+        ).await {
+            tracing::error!(%error, key_id = observation.identity.key_id, "failed to persist request event");
         }
     };
     let mut response = Response::new(Body::from_stream(observed));
@@ -1875,6 +2439,9 @@ async fn shutdown_signal(state: AppState) {
     let terminate = std::future::pending::<()>();
 
     tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
+    if let Err(error) = flush_request_events(&state).await {
+        tracing::warn!(%error, "failed to flush request events during shutdown");
+    }
     if let Some(child) = state.child.lock().await.as_mut() {
         let _ = child.kill().await;
     }
@@ -1884,8 +2451,9 @@ async fn shutdown_signal(state: AppState) {
 mod tests {
     use super::{
         AccountQuota, RoutingSettings, TrafficPolicy, UsageDelta, apply_billing_value,
-        apply_routing_settings_to_yaml, extract_usage_delta, inject_prompt_cache_key,
-        remove_top_level_yaml_section, routing_settings_from_config, validate_traffic_policy,
+        apply_routing_settings_to_yaml, extract_error_message, extract_usage_delta,
+        inject_prompt_cache_key, remove_top_level_yaml_section, routing_settings_from_config,
+        validate_traffic_policy,
     };
     use axum::http::HeaderMap;
     use serde_json::json;
@@ -2096,5 +2664,17 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn extracts_and_limits_upstream_error_messages() {
+        let body = br#"{"error":{"message":"quota exceeded"}}"#;
+        assert_eq!(
+            extract_error_message(body).as_deref(),
+            Some("quota exceeded")
+        );
+
+        let long = vec![b'x'; 800];
+        assert_eq!(extract_error_message(&long).unwrap().chars().count(), 500);
     }
 }
